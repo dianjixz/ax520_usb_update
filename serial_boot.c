@@ -1,5 +1,6 @@
 #define _DEFAULT_SOURCE
 #include "serial_boot.h"
+#include "progress.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -271,6 +272,7 @@ int serial_flash_comboot(const char *device, unsigned int baud,
                          uint32_t erase_size)
 {
     unsigned char chunk[CHUNK_SIZE], payload[8];
+    progress_t progress = {0};
     struct stat info;
     uint32_t offset = 0;
     size_t length;
@@ -299,6 +301,7 @@ int serial_flash_comboot(const char *device, unsigned int baud,
         expect_ack(fd, 180000) != 0)
         goto out;
 
+    progress_start(&progress, "Serial comboot", (uint64_t)info.st_size);
     while ((length = fread(chunk, 1, sizeof(chunk), image)) != 0) {
         size_t padded = (length + 3) & ~(size_t)3;
         if ((uint64_t)offset + padded > erase_size)
@@ -307,21 +310,20 @@ int serial_flash_comboot(const char *device, unsigned int baud,
         if (program_chunk(fd, address + offset, chunk, padded) != 0)
             goto out;
         offset += (uint32_t)padded;
-        if (offset % (32 * 1024) == 0 || offset >= (uint32_t)info.st_size)
-            printf("Serial comboot: %u/%lld bytes\n",
-                   offset > (uint32_t)info.st_size ? (uint32_t)info.st_size : offset,
-                   (long long)info.st_size);
+        progress_update(&progress, offset);
     }
     if (ferror(image) || offset != ((uint64_t)info.st_size + 3) / 4 * 4)
         goto out;
+    progress_finish(&progress);
 
     put_be32(payload, address);
     if (send_command(fd, RUN_CMD, payload, 4) != 0 ||
         expect_ack(fd, 1000) != 0)
         goto out;
-    printf("Comboot started; waiting for USB download device\n");
+    printf("Comboot started\n");
     ret = 0;
 out:
+    progress_abort(&progress);
     if (fd >= 0)
         close(fd);
     fclose(image);

@@ -12,6 +12,7 @@
 #include <libusb-1.0/libusb.h>
 #include "usb_update.h"
 #include "image_package.h"
+#include "progress.h"
 #include "serial_boot.h"
 
 #ifndef PATH_MAX
@@ -487,30 +488,40 @@ static int cmd_transfer_data_safe(update_transport_t *transport, int pack_size,
 static int cmd_transfer_end_safe(update_transport_t *transport)
 {
     unsigned char data[BUFFER_SIZE];
+    progress_t progress = {0};
     int actual_length, ret;
 
     ret = fdl_send_frame(transport, FDL_CMD_START_TRANSFER_END, NULL, 0);
     if (ret != 0)
         return ret;
+    progress_start(&progress, "USB device write", 100);
     for (;;) {
         ret = fdl_receive_frame(transport, data, sizeof(data), &actual_length,
                                 10000);
         if (ret != 0)
-            return ret;
+            break;
         switch (get_le16(data + 6)) {
         case FDL_RESP_UPDATE_IN:
-            if (get_le16(data + 4) != 1)
-                return LIBUSB_ERROR_IO;
-            printf("Process: %u%%\n", data[8]);
+            if (get_le16(data + 4) != 1) {
+                ret = LIBUSB_ERROR_IO;
+                goto out;
+            }
+            progress_update(&progress, data[8]);
             break;
         case FDL_RESP_ACK:
+            progress_finish(&progress);
             return 0;
         case FDL_RESP_OPERATION_FAIL:
-            return LIBUSB_ERROR_IO;
+            ret = LIBUSB_ERROR_IO;
+            goto out;
         default:
-            return LIBUSB_ERROR_IO;
+            ret = LIBUSB_ERROR_IO;
+            goto out;
         }
     }
+out:
+    progress_abort(&progress);
+    return ret;
 }
 
 static int cmd_execute_safe(update_transport_t *transport)
@@ -572,6 +583,9 @@ static int update_one_image(update_transport_t *transport,
                             const image_entry_t *entry)
 {
     unsigned char buffer[UPDATE_PER_PACK];
+    char progress_label[64];
+    progress_t progress = {0};
+    uint64_t bytes_sent = 0;
     int ret, fd, count, retries;
 
     fd = open(entry->path, O_RDONLY);
@@ -585,6 +599,9 @@ static int update_one_image(update_transport_t *transport,
                              entry->erase_size);
     if (ret != 0)
         goto out;
+    snprintf(progress_label, sizeof(progress_label), "USB transfer %.50s",
+             entry->name);
+    progress_start(&progress, progress_label, entry->file_size);
     while ((count = read(fd, buffer, sizeof(buffer))) > 0) {
         for (retries = 0; retries < MAX_ERRORS; retries++) {
             ret = cmd_transfer_data_safe(transport, count, buffer);
@@ -593,19 +610,29 @@ static int update_one_image(update_transport_t *transport,
         }
         if (ret != 0)
             goto out;
+        bytes_sent += (uint64_t)count;
+        progress_update(&progress, bytes_sent);
     }
     if (count < 0) {
         fprintf(stderr, "read %s: %s\n", entry->name, strerror(errno));
         ret = LIBUSB_ERROR_IO;
         goto out;
     }
+    if (bytes_sent != entry->file_size) {
+        fprintf(stderr, "image size changed while reading %s\n", entry->name);
+        ret = LIBUSB_ERROR_IO;
+        goto out;
+    }
+    progress_finish(&progress);
     ret = cmd_transfer_end_safe(transport);
 out:
+    progress_abort(&progress);
     close(fd);
     return ret;
 }
 
-static int update_usb(const image_package_t *package)
+static int update_usb(const image_entry_t *entries, size_t count,
+                      size_t skip_index)
 {
     update_transport_t transport = {0};
     size_t i;
@@ -622,13 +649,13 @@ static int update_usb(const image_package_t *package)
                 libusb_error_name(ret));
         goto out;
     }
-    for (i = 0; i < package->count; i++) {
-        if (i == package->comboot_index)
+    for (i = 0; i < count; i++) {
+        if (i == skip_index)
             continue;
-        ret = update_one_image(&transport, &package->entries[i]);
+        ret = update_one_image(&transport, &entries[i]);
         if (ret != 0) {
             fprintf(stderr, "USB update failed for %s: %s\n",
-                    package->entries[i].name, libusb_error_name(ret));
+                    entries[i].name, libusb_error_name(ret));
             goto out;
         }
     }
@@ -643,11 +670,17 @@ out:
 static void print_usage(FILE *stream, const char *program)
 {
     fprintf(stream,
-            "Usage: %s -p tty-device [-b baud] ax520_image_spi.zip\n"
-            "  -p DEVICE  serial bootloader tty device\n"
+            "Usage:\n"
+            "  %s -p tty-device [-b baud] ax520_image_spi.zip\n"
+            "  %s -u ax520_image_spi.zip\n"
+            "  %s [-p tty-device] [-b baud] [bootload image] "
+            "flash image start [flash image start ...]\n"
+            "  %s -p tty-device [-b baud] bootload image\n"
+            "  -p DEVICE  serial bootloader tty device (for bootload)\n"
             "  -b BAUD    serial baud rate (default: 115200)\n"
+            "  -u         skip ZIP bootload; update remaining images over USB\n"
             "  -h         show this help\n",
-            program);
+            program, program, program, program);
 }
 
 static int parse_baud_rate(const char *text, unsigned int *baud)
@@ -664,24 +697,170 @@ static int parse_baud_rate(const char *text, unsigned int *baud)
     return 0;
 }
 
+static int wait_and_update_usb(const image_entry_t *entries, size_t count,
+                               size_t skip_index)
+{
+    if (libusb_get_vid_pid() != 0)
+        return -1;
+    usleep(100000);
+    return update_usb(entries, count, skip_index);
+}
+
+static int run_zip(const char *zip_path, const char *serial_device,
+                   unsigned int baud, int skip_bootload)
+{
+    image_package_t package;
+    const image_entry_t *comboot;
+    int ret;
+
+    if (!skip_bootload && serial_device == NULL) {
+        fprintf(stderr, "ZIP mode requires -p tty-device\n");
+        return -1;
+    }
+    if (image_package_load(&package, zip_path) != 0)
+        return -1;
+    comboot = &package.entries[package.comboot_index];
+    printf("ZIP validated: %zu images, comboot %s\n",
+           package.count, comboot->name);
+    fflush(stdout);
+    ret = 0;
+    if (skip_bootload)
+        printf("Skipping comboot bootload; waiting for USB download device\n");
+    else
+        ret = serial_flash_comboot(serial_device, baud, comboot->path,
+                                   comboot->address, comboot->erase_size);
+    if (ret == 0)
+        ret = wait_and_update_usb(package.entries, package.count,
+                                   package.comboot_index);
+    image_package_release(&package);
+    return ret;
+}
+
+static int parse_flash_address(const char *text, uint32_t *address)
+{
+    unsigned long value;
+    char *end;
+
+    errno = 0;
+    value = strtoul(text, &end, 0);
+    if (errno != 0 || end == text || *end != '\0' || *text == '-' ||
+        value < 0x03000000UL || value >= 0x04000000UL)
+        return -1;
+    *address = (uint32_t)value;
+    return 0;
+}
+
+static int prepare_flash_image(image_entry_t *entry, const char *path,
+                               const char *start)
+{
+    struct stat info;
+    const char *name;
+
+    if (parse_flash_address(start, &entry->address) != 0) {
+        fprintf(stderr, "invalid flash start address: %s\n", start);
+        return -1;
+    }
+    if (realpath(path, entry->path) == NULL ||
+        stat(entry->path, &info) != 0 || !S_ISREG(info.st_mode) ||
+        info.st_size <= 0 || info.st_size > UINT32_MAX ||
+        (uint64_t)entry->address + (uint64_t)info.st_size > 0x04000000ULL) {
+        fprintf(stderr, "invalid flash image or address range: %s\n", path);
+        return -1;
+    }
+    name = strrchr(entry->path, '/');
+    name = name == NULL ? entry->path : name + 1;
+    if (snprintf(entry->name, sizeof(entry->name), "%s", name) >=
+        (int)sizeof(entry->name)) {
+        fprintf(stderr, "image filename too long: %s\n", path);
+        return -1;
+    }
+    entry->file_size = (uint32_t)info.st_size;
+    entry->erase_size = entry->file_size;
+    return 0;
+}
+
+static int run_commands(int argc, char *argv[], int first,
+                        const char *serial_device, unsigned int baud)
+{
+    image_entry_t *entries;
+    const char *boot_image = NULL;
+    struct stat info;
+    size_t count = 0;
+    int i, ret = -1;
+
+    entries = calloc((size_t)(argc - first), sizeof(*entries));
+    if (entries == NULL)
+        return -1;
+    for (i = first; i < argc;) {
+        if (strcmp(argv[i], "bootload") == 0) {
+            if (boot_image != NULL || count != 0) {
+                fprintf(stderr, "bootload must appear once before flash\n");
+                goto out;
+            }
+            if (i + 1 >= argc) {
+                fprintf(stderr, "bootload requires an image\n");
+                goto out;
+            }
+            boot_image = argv[i + 1];
+            if (stat(boot_image, &info) != 0 || !S_ISREG(info.st_mode) ||
+                info.st_size <= 0 || info.st_size > 0x30000) {
+                fprintf(stderr, "invalid bootload image: %s\n", boot_image);
+                goto out;
+            }
+            i += 2;
+        } else if (strcmp(argv[i], "flash") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "flash requires an image and start address\n");
+                goto out;
+            }
+            if (prepare_flash_image(&entries[count], argv[i + 1],
+                                    argv[i + 2]) != 0)
+                goto out;
+            count++;
+            i += 3;
+        } else {
+            fprintf(stderr, "unknown command: %s\n", argv[i]);
+            goto out;
+        }
+    }
+    if (boot_image != NULL && serial_device == NULL) {
+        fprintf(stderr, "bootload requires -p tty-device\n");
+        goto out;
+    }
+    if (boot_image != NULL &&
+        serial_flash_comboot(serial_device, baud, boot_image,
+                             0x03000000U, 0x30000U) != 0)
+        goto out;
+    if (count != 0 && wait_and_update_usb(entries, count, SIZE_MAX) != 0)
+        goto out;
+    ret = 0;
+out:
+    free(entries);
+    return ret;
+}
+
 int main(int argc, char *argv[])
 {
     const char *serial_device = NULL;
-    image_package_t package;
-    const image_entry_t *comboot;
     unsigned int baud = 115200;
+    int baud_set = 0;
+    int skip_bootload = 0;
     int option, ret;
 
-    while ((option = getopt(argc, argv, "b:hp:")) != -1) {
+    while ((option = getopt(argc, argv, "+b:hp:u")) != -1) {
         switch (option) {
         case 'b':
             if (parse_baud_rate(optarg, &baud) != 0) {
                 fprintf(stderr, "invalid baud rate: %s\n", optarg);
                 return EXIT_FAILURE;
             }
+            baud_set = 1;
             break;
         case 'p':
             serial_device = optarg;
+            break;
+        case 'u':
+            skip_bootload = 1;
             break;
         case 'h':
             print_usage(stdout, argv[0]);
@@ -692,31 +871,35 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (serial_device == NULL || argc - optind != 1) {
+    if (optind >= argc) {
         print_usage(stderr, argv[0]);
         return EXIT_FAILURE;
     }
-    if (!serial_baud_supported(baud)) {
+    if (skip_bootload &&
+        (strcmp(argv[optind], "bootload") == 0 ||
+         strcmp(argv[optind], "flash") == 0)) {
+        fprintf(stderr, "-u is only valid for ZIP updates\n");
+        return EXIT_FAILURE;
+    }
+    if (baud_set && serial_device == NULL && !skip_bootload) {
+        fprintf(stderr, "-b requires -p tty-device\n");
+        return EXIT_FAILURE;
+    }
+    if (!skip_bootload && serial_device != NULL &&
+        !serial_baud_supported(baud)) {
         fprintf(stderr, "unsupported baud rate: %u\n", baud);
         return EXIT_FAILURE;
     }
 
-    if (image_package_load(&package, argv[optind]) != 0)
+    if (strcmp(argv[optind], "bootload") == 0 ||
+        strcmp(argv[optind], "flash") == 0)
+        ret = run_commands(argc, argv, optind, serial_device, baud);
+    else if (argc - optind == 1)
+        ret = run_zip(argv[optind], serial_device, baud, skip_bootload);
+    else {
+        print_usage(stderr, argv[0]);
         return EXIT_FAILURE;
-    comboot = &package.entries[package.comboot_index];
-    printf("ZIP validated: %zu images, comboot %s\n",
-           package.count, comboot->name);
-    fflush(stdout);
-    ret = serial_flash_comboot(serial_device, baud, comboot->path,
-                               comboot->address, comboot->erase_size);
-    if (ret == 0) {
-        ret = libusb_get_vid_pid();
-        if (ret == 0)
-            usleep(100000);
     }
-    if (ret == 0)
-        ret = update_usb(&package);
-    image_package_release(&package);
     if (ret != 0) {
         fprintf(stderr, "firmware update failed\n");
         return EXIT_FAILURE;

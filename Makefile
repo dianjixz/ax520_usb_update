@@ -3,7 +3,7 @@ PKG_CONFIG ?= pkg-config
 
 BUILD_DIR := build
 TARGET := $(BUILD_DIR)/usb_update
-SOURCES := libusb_usb_update.c libusb_vid_pid.c serial_boot.c image_package.c
+SOURCES := libusb_usb_update.c libusb_vid_pid.c serial_boot.c image_package.c progress.c
 OBJECTS := $(addprefix $(BUILD_DIR)/,$(SOURCES:.c=.o))
 DEPS := $(OBJECTS:.o=.d)
 
