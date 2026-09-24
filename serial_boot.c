@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <termios.h>
@@ -24,6 +25,15 @@
 #define EXECPROG_CMD 0x1d
 #define ERASE_CMD 0x45
 #define CHUNK_SIZE 256
+
+struct serial_log_monitor {
+    int fd;
+    int show_log;
+    int log_line_start;
+    int progress_active;
+};
+
+typedef serial_log_monitor_t serial_reader_t;
 
 static int baud_speed(unsigned int baud, speed_t *speed)
 {
@@ -180,25 +190,127 @@ static int send_command(int fd, unsigned char command,
     return write_all(fd, frame, length + 4, now_ms() + 3000);
 }
 
-static int receive_command(int fd, int64_t deadline)
+static void print_serial_log_byte(serial_reader_t *reader, unsigned char byte)
 {
-    unsigned char byte, command, checksum;
-    while (read_byte(fd, &byte, deadline) == 0) {
-        if (byte != START_BYTE)
-            continue;
-        if (read_byte(fd, &command, deadline) != 0 ||
-            read_byte(fd, &checksum, deadline) != 0 ||
-            read_byte(fd, &byte, deadline) != 0)
-            return -1;
-        if (byte == END_BYTE && checksum == 0)
-            return command;
+    if (!reader->show_log)
+        return;
+    if (byte == '\r' || byte == '\n') {
+        if (!reader->log_line_start) {
+            fputc('\n', stderr);
+            reader->log_line_start = 1;
+        }
+    } else if (byte == '\t' || (byte >= 0x20 && byte != 0x7f)) {
+        if (reader->log_line_start) {
+            if (reader->progress_active && isatty(STDOUT_FILENO))
+                fputc('\n', stderr);
+            fputs("[serial] ", stderr);
+            reader->log_line_start = 0;
+        }
+        fputc(byte, stderr);
     }
+    fflush(stderr);
+}
+
+static void finish_serial_log_line(serial_reader_t *reader)
+{
+    if (reader->show_log && !reader->log_line_start) {
+        fputc('\n', stderr);
+        fflush(stderr);
+        reader->log_line_start = 1;
+    }
+}
+
+void serial_log_drain(serial_log_monitor_t *monitor)
+{
+    unsigned char buffer[256];
+    struct pollfd pfd;
+    size_t total = 0, i;
+    ssize_t count;
+    int ready;
+
+    if (monitor == NULL || monitor->fd < 0)
+        return;
+    while (total < 4096) {
+        pfd.fd = monitor->fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        ready = poll(&pfd, 1, 0);
+        if (ready == 0)
+            break;
+        if (ready < 0 && errno == EINTR)
+            continue;
+        if (ready < 0 || !(pfd.revents & POLLIN)) {
+            if (ready < 0 ||
+                (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+                goto disconnected;
+            break;
+        }
+        count = read(monitor->fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            for (i = 0; i < (size_t)count; i++)
+                print_serial_log_byte(monitor, buffer[i]);
+            total += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR)
+            continue;
+        /* VMIN=0 permits a zero-byte read even when the tty is still open. */
+        if (count == 0 && !(pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+            break;
+        if (count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            goto disconnected;
+        break;
+    }
+    return;
+
+disconnected:
+    finish_serial_log_line(monitor);
+    close(monitor->fd);
+    monitor->fd = -1;
+}
+
+void serial_log_close(serial_log_monitor_t *monitor)
+{
+    if (monitor == NULL)
+        return;
+    finish_serial_log_line(monitor);
+    if (monitor->fd >= 0)
+        close(monitor->fd);
+    free(monitor);
+}
+
+static int receive_command(serial_reader_t *reader, int64_t deadline)
+{
+    unsigned char frame[4];
+    size_t i;
+
+    while (read_byte(reader->fd, &frame[0], deadline) == 0) {
+        if (frame[0] != START_BYTE) {
+            print_serial_log_byte(reader, frame[0]);
+            continue;
+        }
+        for (i = 1; i < sizeof(frame); i++) {
+            if (read_byte(reader->fd, &frame[i], deadline) != 0)
+                break;
+        }
+        if (i == sizeof(frame) && frame[3] == END_BYTE && frame[2] == 0) {
+            finish_serial_log_line(reader);
+            return frame[1];
+        }
+        for (size_t j = 0; j < i; j++)
+            print_serial_log_byte(reader, frame[j]);
+        if (i != sizeof(frame)) {
+            finish_serial_log_line(reader);
+            return -1;
+        }
+    }
+    finish_serial_log_line(reader);
     return -1;
 }
 
-static int expect_ack(int fd, unsigned int timeout_ms)
+static int expect_ack(serial_reader_t *reader, unsigned int timeout_ms)
 {
-    int response = receive_command(fd, now_ms() + timeout_ms);
+    int response = receive_command(reader, now_ms() + timeout_ms);
     if (response != ACK_OK) {
         fprintf(stderr, "serial ACK error: %d\n", response);
         return -1;
@@ -206,24 +318,24 @@ static int expect_ack(int fd, unsigned int timeout_ms)
     return 0;
 }
 
-static int handshake(int fd)
+static int handshake(serial_reader_t *reader)
 {
     int64_t deadline = now_ms() + 10000;
     int response;
 
-    while ((response = receive_command(fd, deadline)) >= 0) {
+    while ((response = receive_command(reader, deadline)) >= 0) {
         if (response != HDBOOT_NOTIFY && response != MINIBOOT_NOTIFY)
             continue;
         printf("Serial boot notify: %s\n",
                response == HDBOOT_NOTIFY ? "HDBOOT" : "MINIBOOT");
-        if (send_command(fd, DEBUG_CMD, NULL, 0) != 0)
+        if (send_command(reader->fd, DEBUG_CMD, NULL, 0) != 0)
             return -1;
         if (response == MINIBOOT_NOTIFY) {
             /* Some MINIBOOT versions acknowledge DEBUG and others do not. */
-            response = receive_command(fd, now_ms() + 200);
+            response = receive_command(reader, now_ms() + 200);
             return response == -1 || response == ACK_OK ? 0 : -1;
         }
-        return expect_ack(fd, 1000);
+        return expect_ack(reader, 1000);
     }
     fprintf(stderr, "serial boot notification timed out\n");
     return -1;
@@ -246,7 +358,7 @@ static unsigned char crc8(const unsigned char *data, size_t length)
     return (unsigned char)(crc >> 8);
 }
 
-static int program_chunk(int fd, uint32_t address,
+static int program_chunk(serial_reader_t *reader, uint32_t address,
                          const unsigned char *data, size_t length)
 {
     unsigned char payload[8 + CHUNK_SIZE];
@@ -255,23 +367,27 @@ static int program_chunk(int fd, uint32_t address,
     put_be32(payload, address);
     put_be32(payload + 4, (uint32_t)length / 4);
     memcpy(payload + 8, data, length);
-    if (send_command(fd, DLOAD_CMD, payload, 8 + length) != 0 ||
-        expect_ack(fd, 1000) != 0)
+    if (send_command(reader->fd, DLOAD_CMD, payload, 8 + length) != 0 ||
+        expect_ack(reader, 1000) != 0)
         return -1;
 
     size_with_crc = ((uint32_t)crc8(data, length) << 24) | (uint32_t)length;
     put_be32(payload + 4, size_with_crc);
-    if (send_command(fd, EXECPROG_CMD, payload, 8) != 0 ||
-        expect_ack(fd, 1000) != 0)
+    if (send_command(reader->fd, EXECPROG_CMD, payload, 8) != 0 ||
+        expect_ack(reader, 1000) != 0)
         return -1;
     return 0;
 }
 
 int serial_flash_comboot(const char *device, unsigned int baud,
                          const char *image_path, uint32_t address,
-                         uint32_t erase_size)
+                         uint32_t erase_size, int show_log,
+                         serial_log_monitor_t **monitor_out)
 {
     unsigned char chunk[CHUNK_SIZE], payload[8];
+    serial_reader_t local_reader = {.fd = -1, .show_log = show_log,
+                                    .log_line_start = 1};
+    serial_reader_t *reader = &local_reader;
     progress_t progress = {0};
     struct stat info;
     uint32_t offset = 0;
@@ -280,34 +396,45 @@ int serial_flash_comboot(const char *device, unsigned int baud,
     int fd = -1;
     int ret = -1;
 
+    if (monitor_out != NULL) {
+        *monitor_out = NULL;
+        if (show_log) {
+            reader = malloc(sizeof(*reader));
+            if (reader == NULL)
+                return -1;
+            *reader = local_reader;
+        }
+    }
     if (stat(image_path, &info) != 0 || info.st_size <= 0 ||
         (uint64_t)info.st_size > erase_size || erase_size % 4 != 0) {
         fprintf(stderr, "invalid comboot image size or erase range\n");
-        return -1;
+        goto out;
     }
     image = fopen(image_path, "rb");
     if (image == NULL)
-        return -1;
+        goto out;
     fd = open_serial(device, baud);
     if (fd < 0)
         goto out;
-    if (handshake(fd) != 0)
+    reader->fd = fd;
+    if (handshake(reader) != 0)
         goto out;
 
     put_be32(payload, address);
     put_be32(payload + 4, erase_size / 4);
     printf("Serial erase comboot at 0x%08x, size 0x%x\n", address, erase_size);
     if (send_command(fd, ERASE_CMD, payload, sizeof(payload)) != 0 ||
-        expect_ack(fd, 180000) != 0)
+        expect_ack(reader, 180000) != 0)
         goto out;
 
     progress_start(&progress, "Serial comboot", (uint64_t)info.st_size);
+    reader->progress_active = 1;
     while ((length = fread(chunk, 1, sizeof(chunk), image)) != 0) {
         size_t padded = (length + 3) & ~(size_t)3;
         if ((uint64_t)offset + padded > erase_size)
             goto out;
         memset(chunk + length, 0xff, padded - length);
-        if (program_chunk(fd, address + offset, chunk, padded) != 0)
+        if (program_chunk(reader, address + offset, chunk, padded) != 0)
             goto out;
         offset += (uint32_t)padded;
         progress_update(&progress, offset);
@@ -315,17 +442,26 @@ int serial_flash_comboot(const char *device, unsigned int baud,
     if (ferror(image) || offset != ((uint64_t)info.st_size + 3) / 4 * 4)
         goto out;
     progress_finish(&progress);
+    reader->progress_active = 0;
 
     put_be32(payload, address);
     if (send_command(fd, RUN_CMD, payload, 4) != 0 ||
-        expect_ack(fd, 1000) != 0)
+        expect_ack(reader, 1000) != 0)
         goto out;
     printf("Comboot started\n");
     ret = 0;
 out:
+    finish_serial_log_line(reader);
     progress_abort(&progress);
+    if (ret == 0 && monitor_out != NULL && show_log) {
+        *monitor_out = reader;
+        fd = -1;
+    } else if (reader != &local_reader) {
+        free(reader);
+    }
     if (fd >= 0)
         close(fd);
-    fclose(image);
+    if (image != NULL)
+        fclose(image);
     return ret;
 }

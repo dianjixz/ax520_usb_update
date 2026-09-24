@@ -66,6 +66,7 @@ typedef enum {
 
 #define SYS_USB_PATH "/sys/bus/usb/devices"
 extern int libusb_get_vid_pid(void);
+extern int libusb_get_vid_pid_with_callback(void (*on_wait)(void *), void *context);
 
 #define up_debug(fmt, ...)  // printf(fmt, ##__VA_ARGS__)
 

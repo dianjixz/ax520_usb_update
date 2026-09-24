@@ -24,6 +24,16 @@ make
 ./build/usb_update -p /dev/ttyUSB0 -b 921600 ax520_image_spi.zip
 ```
 
+串口阶段需要同时查看设备日志时，加 `-l`：
+
+```sh
+./build/usb_update -p /dev/ttyUSB0 -l ax520_image_spi.zip
+```
+
+设备输出的文本会以 `[serial]` 前缀打印到标准错误；协议通知和 ACK 不会混入日志。
+启动 comboot 后，程序在等待 USB 设备出现时会继续打印串口日志；USB 出现或等待超时后
+关闭串口。`-l` 只适用于实际执行串口 bootload 的模式，纯 USB 模式不能使用。
+
 如果设备已经运行 comboot 并进入 USB 下载模式，省略 `-p` 即可跳过串口
 bootload 阶段，直接烧录 ZIP 中除 comboot 外的镜像：
 
@@ -67,7 +77,7 @@ flowchart TD
 
 `bootload <image>` 通过启动串口把 comboot 镜像写入 `0x03000000`，然后执行它。
 该命令可以单独运行；此时程序不会等待 USB，也不会继续烧录其他镜像。
-`-p` 为必填参数，`-b` 默认为 `115200`。
+`-p` 为必填参数，`-b` 默认为 `115200`；也可以加 `-l` 查看串口设备日志。
 
 ```sh
 ./build/usb_update -p /dev/ttyUSB0 bootload comboot.fimg

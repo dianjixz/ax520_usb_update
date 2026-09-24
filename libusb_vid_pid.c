@@ -82,11 +82,13 @@ int check_usb_device_present(void)
     return 0;
 }
 
-int libusb_get_vid_pid(void)
+int libusb_get_vid_pid_with_callback(void (*on_wait)(void *), void *context)
 {
     time_t start = time(NULL);
 
     while (1) {
+        if (on_wait != NULL)
+            on_wait(context);
         if (check_usb_device_present() > 0) {
             printf("device detected\n");
             return 0;
@@ -102,4 +104,9 @@ int libusb_get_vid_pid(void)
     }
 
     return 1;
+}
+
+int libusb_get_vid_pid(void)
+{
+    return libusb_get_vid_pid_with_callback(NULL, NULL);
 }

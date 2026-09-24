@@ -671,12 +671,13 @@ static void print_usage(FILE *stream, const char *program)
 {
     fprintf(stream,
             "Usage:\n"
-            "  %s [-p tty-device] [-b baud] [-u] ax520_image_spi.zip\n"
-            "  %s [-p tty-device] [-b baud] [bootload image] "
-            "flash image start [flash image start ...]\n"
-            "  %s -p tty-device [-b baud] bootload image\n"
+            "  %s [-p tty-device] [-b baud] [-l] [-u] ax520_image_spi.zip\n"
+            "  %s -p tty-device [-b baud] [-l] bootload image "
+            "[flash image start ...]\n"
+            "  %s flash image start [flash image start ...]\n"
             "  -p DEVICE  serial bootloader tty device (for bootload)\n"
             "  -b BAUD    serial baud rate (default: 115200)\n"
+            "  -l         print serial logs during bootload and USB wait\n"
             "  -u         force USB-only ZIP update even when -p is set\n"
             "  -h         show this help\n",
             program, program, program);
@@ -696,22 +697,39 @@ static int parse_baud_rate(const char *text, unsigned int *baud)
     return 0;
 }
 
-static int wait_and_update_usb(const image_entry_t *entries, size_t count,
-                               size_t skip_index)
+static void drain_serial_log(void *context)
 {
+    serial_log_drain(context);
+}
+
+static int wait_and_update_usb(const image_entry_t *entries, size_t count,
+                               size_t skip_index,
+                               serial_log_monitor_t *serial_monitor)
+{
+    int ret;
+
     printf("Waiting for USB download device 32c9:1000\n");
     fflush(stdout);
-    if (libusb_get_vid_pid() != 0)
+    if (serial_monitor != NULL) {
+        ret = libusb_get_vid_pid_with_callback(drain_serial_log,
+                                                serial_monitor);
+        serial_log_drain(serial_monitor);
+        serial_log_close(serial_monitor);
+    } else {
+        ret = libusb_get_vid_pid();
+    }
+    if (ret != 0)
         return -1;
     usleep(100000);
     return update_usb(entries, count, skip_index);
 }
 
 static int run_zip(const char *zip_path, const char *serial_device,
-                   unsigned int baud, int skip_bootload)
+                   unsigned int baud, int skip_bootload, int show_serial_log)
 {
     image_package_t package;
     const image_entry_t *comboot;
+    serial_log_monitor_t *serial_monitor = NULL;
     int use_serial = serial_device != NULL && !skip_bootload;
     int ret;
 
@@ -727,10 +745,12 @@ static int run_zip(const char *zip_path, const char *serial_device,
     ret = 0;
     if (use_serial)
         ret = serial_flash_comboot(serial_device, baud, comboot->path,
-                                   comboot->address, comboot->erase_size);
+                                   comboot->address, comboot->erase_size,
+                                   show_serial_log,
+                                   show_serial_log ? &serial_monitor : NULL);
     if (ret == 0)
         ret = wait_and_update_usb(package.entries, package.count,
-                                   package.comboot_index);
+                                   package.comboot_index, serial_monitor);
     image_package_release(&package);
     return ret;
 }
@@ -779,10 +799,12 @@ static int prepare_flash_image(image_entry_t *entry, const char *path,
 }
 
 static int run_commands(int argc, char *argv[], int first,
-                        const char *serial_device, unsigned int baud)
+                        const char *serial_device, unsigned int baud,
+                        int show_serial_log)
 {
     image_entry_t *entries;
     const char *boot_image = NULL;
+    serial_log_monitor_t *serial_monitor = NULL;
     struct stat info;
     size_t count = 0;
     int i, ret = -1;
@@ -832,9 +854,12 @@ static int run_commands(int argc, char *argv[], int first,
     fflush(stdout);
     if (boot_image != NULL &&
         serial_flash_comboot(serial_device, baud, boot_image,
-                             0x03000000U, 0x30000U) != 0)
+                             0x03000000U, 0x30000U, show_serial_log,
+                             show_serial_log && count != 0 ?
+                             &serial_monitor : NULL) != 0)
         goto out;
-    if (count != 0 && wait_and_update_usb(entries, count, SIZE_MAX) != 0)
+    if (count != 0 &&
+        wait_and_update_usb(entries, count, SIZE_MAX, serial_monitor) != 0)
         goto out;
     ret = 0;
 out:
@@ -847,9 +872,10 @@ int main(int argc, char *argv[])
     const char *serial_device = NULL;
     unsigned int baud = 115200;
     int skip_bootload = 0;
+    int show_serial_log = 0;
     int option, ret;
 
-    while ((option = getopt(argc, argv, "+b:hp:u")) != -1) {
+    while ((option = getopt(argc, argv, "+b:hlp:u")) != -1) {
         switch (option) {
         case 'b':
             if (parse_baud_rate(optarg, &baud) != 0) {
@@ -859,6 +885,9 @@ int main(int argc, char *argv[])
             break;
         case 'p':
             serial_device = optarg;
+            break;
+        case 'l':
+            show_serial_log = 1;
             break;
         case 'u':
             skip_bootload = 1;
@@ -882,6 +911,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "-u is only valid for ZIP updates\n");
         return EXIT_FAILURE;
     }
+    if (show_serial_log && (serial_device == NULL || skip_bootload ||
+                            strcmp(argv[optind], "flash") == 0)) {
+        fprintf(stderr, "-l requires serial bootload (-p without -u)\n");
+        return EXIT_FAILURE;
+    }
     if (!skip_bootload && serial_device != NULL &&
         strcmp(argv[optind], "flash") != 0 &&
         !serial_baud_supported(baud)) {
@@ -891,9 +925,11 @@ int main(int argc, char *argv[])
 
     if (strcmp(argv[optind], "bootload") == 0 ||
         strcmp(argv[optind], "flash") == 0)
-        ret = run_commands(argc, argv, optind, serial_device, baud);
+        ret = run_commands(argc, argv, optind, serial_device, baud,
+                           show_serial_log);
     else if (argc - optind == 1)
-        ret = run_zip(argv[optind], serial_device, baud, skip_bootload);
+        ret = run_zip(argv[optind], serial_device, baud, skip_bootload,
+                      show_serial_log);
     else {
         print_usage(stderr, argv[0]);
         return EXIT_FAILURE;
