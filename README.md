@@ -11,8 +11,8 @@ make
 
 ## ZIP 整包烧录
 
-连接 AX520 的启动串口和 USB 下载口，使设备进入 HDBOOT 或 MINIBOOT 模式，
-然后运行：
+如果需要先通过串口烧录 comboot，连接 AX520 的启动串口和 USB 下载口，
+使设备进入 HDBOOT 或 MINIBOOT 模式，然后运行：
 
 ```sh
 ./build/usb_update -p /dev/ttyUSB0 ax520_image_spi.zip
@@ -24,23 +24,30 @@ make
 ./build/usb_update -p /dev/ttyUSB0 -b 921600 ax520_image_spi.zip
 ```
 
-如果设备已经运行 comboot 并进入 USB 下载模式，可用 `-u` 跳过串口
+如果设备已经运行 comboot 并进入 USB 下载模式，省略 `-p` 即可跳过串口
 bootload 阶段，直接烧录 ZIP 中除 comboot 外的镜像：
 
 ```sh
-./build/usb_update -u ax520_image_spi.zip
+./build/usb_update ax520_image_spi.zip
 ```
 
-此时不需要 `-p`；即使提供 `-p` 或 `-b`，也不会打开串口。ZIP 及其中所有镜像仍会先完成校验。
+若已提供 `-p` 但仍想跳过串口，可加 `-u` 强制仅使用 USB：
+
+```sh
+./build/usb_update -p /dev/ttyUSB0 -u ax520_image_spi.zip
+```
+
+仅使用 USB 时，`-b` 波特率不会生效。ZIP 及其中所有镜像仍会先完成校验。
+程序启动时会输出所选模式，进入 USB 检测前会输出等待提示。
 
 ## 烧录流程
 
 ```mermaid
 flowchart TD
     A["读取 ax520_image_spi.zip"] --> B["校验 ax520_image.json 和全部镜像"]
-    B --> U{"使用 -u？"}
-    U -- 否 --> C["打开启动串口，等待 HDBOOT / MINIBOOT 通知"]
-    U -- 是 --> G["等待 USB 设备 32c9:1000 枚举"]
+    B --> U{"有 -p 且无 -u？"}
+    U -- 是 --> C["打开启动串口，等待 HDBOOT / MINIBOOT 通知"]
+    U -- 否 --> G["等待 USB 设备 32c9:1000 枚举"]
     C --> D["发送 DEBUG，进入命令模式"]
     D --> E["通过串口擦除并烧录 comboot"]
     E --> F["从 0x03000000 执行 comboot，首次重启"]
@@ -50,8 +57,9 @@ flowchart TD
     I --> J["发送 FDL EXECUTE，最终重启"]
 ```
 
-程序会先读取 ZIP 内的 `ax520_image.json` 并校验所有镜像。默认情况下，
-串口阶段烧录 `comboot` 并执行它；使用 `-u` 时跳过该阶段。设备以 `32c9:1000` 枚举为 USB 下载设备后，
+程序会先读取 ZIP 内的 `ax520_image.json` 并校验所有镜像。指定 `-p`
+且未使用 `-u` 时，串口阶段烧录 `comboot` 并执行它；其他情况跳过该阶段。
+设备以 `32c9:1000` 枚举为 USB 下载设备后，
 程序通过 FDL 烧录其余镜像，最后发送 `EXECUTE` 命令重启设备。
 烧录时分别显示串口 comboot、USB 数据传输和设备写入的进度条。
 

@@ -671,16 +671,15 @@ static void print_usage(FILE *stream, const char *program)
 {
     fprintf(stream,
             "Usage:\n"
-            "  %s -p tty-device [-b baud] ax520_image_spi.zip\n"
-            "  %s -u ax520_image_spi.zip\n"
+            "  %s [-p tty-device] [-b baud] [-u] ax520_image_spi.zip\n"
             "  %s [-p tty-device] [-b baud] [bootload image] "
             "flash image start [flash image start ...]\n"
             "  %s -p tty-device [-b baud] bootload image\n"
             "  -p DEVICE  serial bootloader tty device (for bootload)\n"
             "  -b BAUD    serial baud rate (default: 115200)\n"
-            "  -u         skip ZIP bootload; update remaining images over USB\n"
+            "  -u         force USB-only ZIP update even when -p is set\n"
             "  -h         show this help\n",
-            program, program, program, program);
+            program, program, program);
 }
 
 static int parse_baud_rate(const char *text, unsigned int *baud)
@@ -700,6 +699,8 @@ static int parse_baud_rate(const char *text, unsigned int *baud)
 static int wait_and_update_usb(const image_entry_t *entries, size_t count,
                                size_t skip_index)
 {
+    printf("Waiting for USB download device 32c9:1000\n");
+    fflush(stdout);
     if (libusb_get_vid_pid() != 0)
         return -1;
     usleep(100000);
@@ -711,12 +712,12 @@ static int run_zip(const char *zip_path, const char *serial_device,
 {
     image_package_t package;
     const image_entry_t *comboot;
+    int use_serial = serial_device != NULL && !skip_bootload;
     int ret;
 
-    if (!skip_bootload && serial_device == NULL) {
-        fprintf(stderr, "ZIP mode requires -p tty-device\n");
-        return -1;
-    }
+    printf("Update mode: ZIP (%s)\n",
+           use_serial ? "serial bootload + USB flash" : "USB flash only");
+    fflush(stdout);
     if (image_package_load(&package, zip_path) != 0)
         return -1;
     comboot = &package.entries[package.comboot_index];
@@ -724,9 +725,7 @@ static int run_zip(const char *zip_path, const char *serial_device,
            package.count, comboot->name);
     fflush(stdout);
     ret = 0;
-    if (skip_bootload)
-        printf("Skipping comboot bootload; waiting for USB download device\n");
-    else
+    if (use_serial)
         ret = serial_flash_comboot(serial_device, baud, comboot->path,
                                    comboot->address, comboot->erase_size);
     if (ret == 0)
@@ -827,6 +826,10 @@ static int run_commands(int argc, char *argv[], int first,
         fprintf(stderr, "bootload requires -p tty-device\n");
         goto out;
     }
+    printf("Update mode: %s\n", boot_image != NULL ?
+           (count != 0 ? "serial bootload + USB flash" : "serial bootload") :
+           "USB flash only");
+    fflush(stdout);
     if (boot_image != NULL &&
         serial_flash_comboot(serial_device, baud, boot_image,
                              0x03000000U, 0x30000U) != 0)
@@ -843,7 +846,6 @@ int main(int argc, char *argv[])
 {
     const char *serial_device = NULL;
     unsigned int baud = 115200;
-    int baud_set = 0;
     int skip_bootload = 0;
     int option, ret;
 
@@ -854,7 +856,6 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "invalid baud rate: %s\n", optarg);
                 return EXIT_FAILURE;
             }
-            baud_set = 1;
             break;
         case 'p':
             serial_device = optarg;
@@ -881,11 +882,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "-u is only valid for ZIP updates\n");
         return EXIT_FAILURE;
     }
-    if (baud_set && serial_device == NULL && !skip_bootload) {
-        fprintf(stderr, "-b requires -p tty-device\n");
-        return EXIT_FAILURE;
-    }
     if (!skip_bootload && serial_device != NULL &&
+        strcmp(argv[optind], "flash") != 0 &&
         !serial_baud_supported(baud)) {
         fprintf(stderr, "unsupported baud rate: %u\n", baud);
         return EXIT_FAILURE;
