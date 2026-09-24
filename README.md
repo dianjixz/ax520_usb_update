@@ -31,8 +31,8 @@ make
 ```
 
 设备输出的文本会以 `[serial]` 前缀打印到标准错误；协议通知和 ACK 不会混入日志。
-启动 comboot 后，程序在等待 USB 设备出现时会继续打印串口日志；USB 出现或等待超时后
-关闭串口。`-l` 只适用于实际执行串口 bootload 的模式，纯 USB 模式不能使用。
+启动 comboot 后，程序在等待 USB 设备出现时会继续打印串口日志。`-l` 只控制
+日志打印，下面的 USB 连接检测与复位处理在串口烧录模式下始终启用；纯 USB 模式不能使用 `-l`。
 
 如果设备已经运行 comboot 并进入 USB 下载模式，省略 `-p` 即可跳过串口
 bootload 阶段，直接烧录 ZIP 中除 comboot 外的镜像：
@@ -57,18 +57,31 @@ flowchart TD
     A["读取 ax520_image_spi.zip"] --> B["校验 ax520_image.json 和全部镜像"]
     B --> U{"有 -p 且无 -u？"}
     U -- 是 --> C["打开启动串口，等待 HDBOOT / MINIBOOT 通知"]
-    U -- 否 --> G["等待 USB 设备 32c9:1000 枚举"]
+    U -- 否 --> W["等待 USB 32c9:1000；串口有效时同时监听"]
     C --> D["发送 DEBUG，进入命令模式"]
     D --> E["通过串口擦除并烧录 comboot"]
     E --> F["从 0x03000000 执行 comboot，首次重启"]
-    F --> G["等待 USB 设备 32c9:1000 枚举"]
-    G --> H["通过 USB 完成 FDL 握手和 CONNECT"]
+    F --> W
+    W --> V{"USB 已枚举？"}
+    V -- 是 --> H["通过 USB 完成 FDL 握手和 CONNECT"]
+    V -- 否 --> T{"串口提示？"}
+    T -- "usb connected to host" --> C1["关闭串口"] --> W
+    T -- "usb not plug-in，且复位少于 3 次" --> R["约每 30 毫秒发送回车"]
+    R --> P{"检测到 ub#？"}
+    P -- 否 --> R
+    P -- 是 --> Q["发送 reset，然后继续等待 USB"] --> W
+    T -- "其他或已达 3 次" --> W
     H --> I["通过 USB 烧录 ZIP 中剩余的镜像"]
     I --> J["发送 FDL EXECUTE，最终重启"]
 ```
 
 程序会先读取 ZIP 内的 `ax520_image.json` 并校验所有镜像。指定 `-p`
 且未使用 `-u` 时，串口阶段烧录 `comboot` 并执行它；其他情况跳过该阶段。
+串口烧录后等待 USB 时，如果设备报告 `usb connected to host`，程序关闭串口并继续
+等待 USB 枚举；如果报告 `usb not plug-in`，程序约每 30 毫秒向串口发送一次回车，
+检测到 `ub#` 后发送 `reset\r`。最多执行 3 次复位，随后不再触发复位，
+但继续等待 USB 枚举。
+若复位导致串口暂时断开，程序会尝试通过原 `-p` 路径重新打开串口。
 设备以 `32c9:1000` 枚举为 USB 下载设备后，
 程序通过 FDL 烧录其余镜像，最后发送 `EXECUTE` 命令重启设备。
 烧录时分别显示串口 comboot、USB 数据传输和设备写入的进度条。

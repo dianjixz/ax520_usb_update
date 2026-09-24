@@ -25,12 +25,35 @@
 #define EXECPROG_CMD 0x1d
 #define ERASE_CMD 0x45
 #define CHUNK_SIZE 256
+#define USB_CONNECTED_TEXT "usb connected to host"
+#define USB_NOT_PLUGGED_TEXT "usb not plug-in"
+#define UBOOT_PROMPT "ub#"
+#define SERIAL_PROBE_INTERVAL_MS 30
+#define SERIAL_REOPEN_INTERVAL_MS 500
+#define SERIAL_RESET_LIMIT 3U
+
+typedef enum serial_recovery_state {
+    SERIAL_WAIT_USB,
+    SERIAL_WAIT_PROMPT,
+    SERIAL_SENDING_RESET
+} serial_recovery_state_t;
 
 struct serial_log_monitor {
     int fd;
+    const char *device;
+    unsigned int baud;
     int show_log;
     int log_line_start;
     int progress_active;
+    int stop_monitoring;
+    char recent[sizeof(USB_CONNECTED_TEXT)];
+    size_t recent_length;
+    serial_recovery_state_t recovery_state;
+    int64_t next_probe_ms;
+    int64_t next_reopen_ms;
+    size_t reset_offset;
+    unsigned int reset_count;
+    int reset_limit_reported;
 };
 
 typedef serial_log_monitor_t serial_reader_t;
@@ -72,7 +95,7 @@ int serial_baud_supported(unsigned int baud)
     return baud_speed(baud, &speed) == 0;
 }
 
-static int open_serial(const char *device, unsigned int baud)
+static int open_serial(const char *device, unsigned int baud, int quiet)
 {
     struct termios tty;
     speed_t speed;
@@ -82,11 +105,13 @@ static int open_serial(const char *device, unsigned int baud)
         return -1;
     fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
-        fprintf(stderr, "open %s: %s\n", device, strerror(errno));
+        if (!quiet)
+            fprintf(stderr, "open %s: %s\n", device, strerror(errno));
         return -1;
     }
     if (tcgetattr(fd, &tty) != 0) {
-        fprintf(stderr, "tcgetattr %s: %s\n", device, strerror(errno));
+        if (!quiet)
+            fprintf(stderr, "tcgetattr %s: %s\n", device, strerror(errno));
         close(fd);
         return -1;
     }
@@ -98,7 +123,8 @@ static int open_serial(const char *device, unsigned int baud)
     tty.c_cc[VTIME] = 0;
     if (cfsetispeed(&tty, speed) != 0 || cfsetospeed(&tty, speed) != 0 ||
         tcsetattr(fd, TCSANOW, &tty) != 0) {
-        fprintf(stderr, "configure %s: %s\n", device, strerror(errno));
+        if (!quiet)
+            fprintf(stderr, "configure %s: %s\n", device, strerror(errno));
         close(fd);
         return -1;
     }
@@ -220,6 +246,102 @@ static void finish_serial_log_line(serial_reader_t *reader)
     }
 }
 
+static int serial_recent_ends_with(const serial_log_monitor_t *monitor,
+                                   const char *text, size_t length)
+{
+    return monitor->recent_length >= length &&
+           memcmp(monitor->recent + monitor->recent_length - length,
+                  text, length) == 0;
+}
+
+static int serial_monitor_note_byte(serial_log_monitor_t *monitor,
+                                    unsigned char byte)
+{
+    if (byte == '\r' || byte == '\n' || byte < 0x20 || byte == 0x7f) {
+        monitor->recent_length = 0;
+        return 0;
+    }
+    if (monitor->recent_length == sizeof(monitor->recent)) {
+        memmove(monitor->recent, monitor->recent + 1,
+                sizeof(monitor->recent) - 1);
+        monitor->recent_length--;
+    }
+    if (byte >= 'A' && byte <= 'Z')
+        byte = (unsigned char)(byte + ('a' - 'A'));
+    monitor->recent[monitor->recent_length++] = (char)byte;
+
+    if (serial_recent_ends_with(monitor, USB_CONNECTED_TEXT,
+                                sizeof(USB_CONNECTED_TEXT) - 1)) {
+        finish_serial_log_line(monitor);
+        printf("Device reports USB connected to host; closing serial monitor\n");
+        fflush(stdout);
+        monitor->stop_monitoring = 1;
+        return 1;
+    }
+    if (monitor->recovery_state == SERIAL_WAIT_USB &&
+        serial_recent_ends_with(monitor, USB_NOT_PLUGGED_TEXT,
+                                sizeof(USB_NOT_PLUGGED_TEXT) - 1)) {
+        finish_serial_log_line(monitor);
+        if (monitor->reset_count < SERIAL_RESET_LIMIT) {
+            monitor->recovery_state = SERIAL_WAIT_PROMPT;
+            monitor->next_probe_ms = 0;
+            printf("Device reports USB not plugged in; probing U-Boot prompt\n");
+        } else if (!monitor->reset_limit_reported) {
+            monitor->reset_limit_reported = 1;
+            printf("Serial reset limit reached (%u); still waiting for USB\n",
+                   SERIAL_RESET_LIMIT);
+        }
+        fflush(stdout);
+        monitor->recent_length = 0;
+    } else if (monitor->recovery_state == SERIAL_WAIT_PROMPT &&
+               serial_recent_ends_with(monitor, UBOOT_PROMPT,
+                                       sizeof(UBOOT_PROMPT) - 1)) {
+        finish_serial_log_line(monitor);
+        monitor->recovery_state = SERIAL_SENDING_RESET;
+        monitor->reset_offset = 0;
+        monitor->recent_length = 0;
+        printf("U-Boot prompt detected; preparing reset (%u/%u)\n",
+               monitor->reset_count + 1, SERIAL_RESET_LIMIT);
+        fflush(stdout);
+    }
+    return 0;
+}
+
+static int serial_monitor_send(serial_log_monitor_t *monitor)
+{
+    static const char reset_command[] = "reset\r";
+    const char probe = '\r';
+    ssize_t count;
+    int64_t now = now_ms();
+
+    if (monitor->recovery_state == SERIAL_WAIT_PROMPT &&
+        now >= monitor->next_probe_ms) {
+        count = write(monitor->fd, &probe, 1);
+        if (count == 1)
+            monitor->next_probe_ms = now + SERIAL_PROBE_INTERVAL_MS;
+        else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                 errno != EINTR)
+            return -1;
+    } else if (monitor->recovery_state == SERIAL_SENDING_RESET) {
+        count = write(monitor->fd, reset_command + monitor->reset_offset,
+                      sizeof(reset_command) - 1 - monitor->reset_offset);
+        if (count > 0) {
+            monitor->reset_offset += (size_t)count;
+            if (monitor->reset_offset == sizeof(reset_command) - 1) {
+                monitor->reset_count++;
+                monitor->recovery_state = SERIAL_WAIT_USB;
+                printf("Serial reset sent (%u/%u)\n",
+                       monitor->reset_count, SERIAL_RESET_LIMIT);
+                fflush(stdout);
+            }
+        } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                   errno != EINTR) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 void serial_log_drain(serial_log_monitor_t *monitor)
 {
     unsigned char buffer[256];
@@ -228,8 +350,19 @@ void serial_log_drain(serial_log_monitor_t *monitor)
     ssize_t count;
     int ready;
 
-    if (monitor == NULL || monitor->fd < 0)
+    if (monitor == NULL || monitor->stop_monitoring)
         return;
+    if (monitor->fd < 0) {
+        if (now_ms() < monitor->next_reopen_ms)
+            return;
+        monitor->fd = open_serial(monitor->device, monitor->baud, 1);
+        if (monitor->fd < 0) {
+            monitor->next_reopen_ms = now_ms() + SERIAL_REOPEN_INTERVAL_MS;
+            return;
+        }
+        printf("Serial device reconnected: %s\n", monitor->device);
+        fflush(stdout);
+    }
     while (total < 4096) {
         pfd.fd = monitor->fd;
         pfd.events = POLLIN;
@@ -247,8 +380,11 @@ void serial_log_drain(serial_log_monitor_t *monitor)
         }
         count = read(monitor->fd, buffer, sizeof(buffer));
         if (count > 0) {
-            for (i = 0; i < (size_t)count; i++)
+            for (i = 0; i < (size_t)count; i++) {
                 print_serial_log_byte(monitor, buffer[i]);
+                if (serial_monitor_note_byte(monitor, buffer[i]))
+                    goto disconnected;
+            }
             total += (size_t)count;
             continue;
         }
@@ -261,12 +397,21 @@ void serial_log_drain(serial_log_monitor_t *monitor)
             goto disconnected;
         break;
     }
+    if (serial_monitor_send(monitor) != 0)
+        goto disconnected;
     return;
 
 disconnected:
     finish_serial_log_line(monitor);
     close(monitor->fd);
     monitor->fd = -1;
+    monitor->recent_length = 0;
+    if (monitor->recovery_state == SERIAL_SENDING_RESET) {
+        monitor->recovery_state = SERIAL_WAIT_PROMPT;
+        monitor->reset_offset = 0;
+        monitor->next_probe_ms = 0;
+    }
+    monitor->next_reopen_ms = now_ms() + SERIAL_REOPEN_INTERVAL_MS;
 }
 
 void serial_log_close(serial_log_monitor_t *monitor)
@@ -385,7 +530,8 @@ int serial_flash_comboot(const char *device, unsigned int baud,
                          serial_log_monitor_t **monitor_out)
 {
     unsigned char chunk[CHUNK_SIZE], payload[8];
-    serial_reader_t local_reader = {.fd = -1, .show_log = show_log,
+    serial_reader_t local_reader = {.fd = -1, .device = device, .baud = baud,
+                                    .show_log = show_log,
                                     .log_line_start = 1};
     serial_reader_t *reader = &local_reader;
     progress_t progress = {0};
@@ -398,12 +544,10 @@ int serial_flash_comboot(const char *device, unsigned int baud,
 
     if (monitor_out != NULL) {
         *monitor_out = NULL;
-        if (show_log) {
-            reader = malloc(sizeof(*reader));
-            if (reader == NULL)
-                return -1;
-            *reader = local_reader;
-        }
+        reader = malloc(sizeof(*reader));
+        if (reader == NULL)
+            return -1;
+        *reader = local_reader;
     }
     if (stat(image_path, &info) != 0 || info.st_size <= 0 ||
         (uint64_t)info.st_size > erase_size || erase_size % 4 != 0) {
@@ -413,7 +557,7 @@ int serial_flash_comboot(const char *device, unsigned int baud,
     image = fopen(image_path, "rb");
     if (image == NULL)
         goto out;
-    fd = open_serial(device, baud);
+    fd = open_serial(device, baud, 0);
     if (fd < 0)
         goto out;
     reader->fd = fd;
@@ -453,7 +597,7 @@ int serial_flash_comboot(const char *device, unsigned int baud,
 out:
     finish_serial_log_line(reader);
     progress_abort(&progress);
-    if (ret == 0 && monitor_out != NULL && show_log) {
+    if (ret == 0 && monitor_out != NULL) {
         *monitor_out = reader;
         fd = -1;
     } else if (reader != &local_reader) {

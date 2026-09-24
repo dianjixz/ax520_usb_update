@@ -746,8 +746,7 @@ static int run_zip(const char *zip_path, const char *serial_device,
     if (use_serial)
         ret = serial_flash_comboot(serial_device, baud, comboot->path,
                                    comboot->address, comboot->erase_size,
-                                   show_serial_log,
-                                   show_serial_log ? &serial_monitor : NULL);
+                                   show_serial_log, &serial_monitor);
     if (ret == 0)
         ret = wait_and_update_usb(package.entries, package.count,
                                    package.comboot_index, serial_monitor);
@@ -855,8 +854,7 @@ static int run_commands(int argc, char *argv[], int first,
     if (boot_image != NULL &&
         serial_flash_comboot(serial_device, baud, boot_image,
                              0x03000000U, 0x30000U, show_serial_log,
-                             show_serial_log && count != 0 ?
-                             &serial_monitor : NULL) != 0)
+                             count != 0 ? &serial_monitor : NULL) != 0)
         goto out;
     if (count != 0 &&
         wait_and_update_usb(entries, count, SIZE_MAX, serial_monitor) != 0)
