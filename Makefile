@@ -1,9 +1,10 @@
 CC ?= cc
 PKG_CONFIG ?= pkg-config
 
-TARGET := usb_update
-SOURCES := libusb_usb_update.c libusb_vid_pid.c
-OBJECTS := $(SOURCES:.c=.o)
+BUILD_DIR := build
+TARGET := $(BUILD_DIR)/usb_update
+SOURCES := libusb_usb_update.c libusb_vid_pid.c serial_boot.c image_package.c
+OBJECTS := $(addprefix $(BUILD_DIR)/,$(SOURCES:.c=.o))
 DEPS := $(OBJECTS:.o=.d)
 
 LIBUSB_CFLAGS := $(shell $(PKG_CONFIG) --cflags libusb-1.0 2>/dev/null)
@@ -22,13 +23,16 @@ LDLIBS += $(LIBUSB_LIBS)
 
 all: $(TARGET)
 
-$(TARGET): $(OBJECTS)
+$(TARGET): $(OBJECTS) | $(BUILD_DIR)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-%.o: %.c
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD_DIR):
+	mkdir -p $@
+
 clean:
-	$(RM) $(TARGET) $(OBJECTS) $(DEPS)
+	$(RM) -r $(BUILD_DIR)
 
 -include $(DEPS)

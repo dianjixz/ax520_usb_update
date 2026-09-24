@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <libusb-1.0/libusb.h>
 #include "usb_update.h"
+#include "image_package.h"
+#include "serial_boot.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -28,9 +30,28 @@ typedef struct fdl_frame {
 #define FDL_CMDIDX_SIZE   2
 #define FDL_CHECKSUM_SIZE 2
 
-#define MAX_LINE_LEN 0x100
-
 static const unsigned char fdl_magic[FDL_MAGIC_SIZE] = {0x9f, 0x8e, 0x6d, 0x5c};
+
+typedef struct update_transport {
+    libusb_context *usb_context;
+    libusb_device_handle *usb_handle;
+    int usb_claimed;
+} update_transport_t;
+
+static int transport_send(update_transport_t *transport,
+                          const unsigned char *data, size_t length,
+                          unsigned int timeout)
+{
+    int transferred;
+    int ret;
+
+    ret = libusb_bulk_transfer(transport->usb_handle, USB_UPDATE_OUT_ENDPOINT,
+                               (unsigned char *)data, (int)length,
+                               &transferred, timeout);
+    if (ret != 0)
+        return ret;
+    return transferred == (int)length ? 0 : LIBUSB_ERROR_IO;
+}
 
 static void put_le16(unsigned char *p, unsigned short value)
 {
@@ -91,30 +112,25 @@ static int fdl_build_frame(unsigned char *frame, size_t capacity,
     return (int)total;
 }
 
-static int fdl_send_frame(libusb_device_handle *handle, unsigned short command,
+static int fdl_send_frame(update_transport_t *transport, unsigned short command,
                           const unsigned char *payload, unsigned short payload_len)
 {
     unsigned char frame[BUFFER_SIZE];
-    int length, transferred, ret;
+    int length;
 
     length = fdl_build_frame(frame, sizeof(frame), command, payload, payload_len);
     if (length < 0)
         return LIBUSB_ERROR_INVALID_PARAM;
-    ret = libusb_bulk_transfer(handle, USB_UPDATE_OUT_ENDPOINT, frame, length,
-                               &transferred, 3000);
-    if (ret != 0)
-        return ret;
-    if (transferred != length)
-        return LIBUSB_ERROR_IO;
-    return 0;
+    return transport_send(transport, frame, (size_t)length, 3000);
 }
 
-static int fdl_receive_frame(libusb_device_handle *handle, unsigned char *data,
+static int fdl_receive_frame(update_transport_t *transport, unsigned char *data,
                              size_t capacity, int *actual_length, unsigned int timeout)
 {
     int ret;
 
-    ret = libusb_bulk_transfer(handle, USB_UPDATE_IN_ENDPOINT, data,
+    ret = libusb_bulk_transfer(transport->usb_handle,
+                               USB_UPDATE_IN_ENDPOINT, data,
                                (int)capacity, actual_length, timeout);
     if (ret != 0)
         return ret;
@@ -133,13 +149,14 @@ static int fdl_receive_frame(libusb_device_handle *handle, unsigned char *data,
     return 0;
 }
 
-static int fdl_expect_ack(libusb_device_handle *handle, unsigned short command,
+static int fdl_expect_ack(update_transport_t *transport, unsigned short command,
                           unsigned int timeout)
 {
     unsigned char data[BUFFER_SIZE];
     int actual_length, ret;
 
-    ret = fdl_receive_frame(handle, data, sizeof(data), &actual_length, timeout);
+    ret = fdl_receive_frame(transport, data, sizeof(data), &actual_length,
+                            timeout);
     if (ret != 0)
         return ret;
     if (get_le16(data + 6) != command)
@@ -239,18 +256,17 @@ static short frame_checksum(fdl_frame_t *pframe)
                                (unsigned short)pframe->data_len);
 }
 
-int cmd_handshake(libusb_device_handle *handle)
+static int cmd_handshake(update_transport_t *transport)
 {
     unsigned char probe[] = {0x3c, 0x3c, 0x3c};
     unsigned char data[BUFFER_SIZE];
-    int transferred, actual_length, ret;
+    int actual_length, ret;
 
-    ret = libusb_bulk_transfer(handle, USB_UPDATE_OUT_ENDPOINT, probe,
-                               sizeof(probe), &transferred, 3000);
-    if (ret != 0 || transferred != (int)sizeof(probe))
-        return ret != 0 ? ret : LIBUSB_ERROR_IO;
+    ret = transport_send(transport, probe, sizeof(probe), 3000);
+    if (ret != 0)
+        return ret;
 
-    ret = fdl_receive_frame(handle, data, sizeof(data), &actual_length, 6000);
+    ret = fdl_receive_frame(transport, data, sizeof(data), &actual_length, 6000);
     if (ret != 0)
         return ret;
     if (get_le16(data + 6) != FDL_RESP_VERSION)
@@ -258,26 +274,27 @@ int cmd_handshake(libusb_device_handle *handle)
     return 0;
 }
 
-int cmd_connect(libusb_device_handle *handle)
+static int cmd_connect(update_transport_t *transport)
 {
-    int ret = fdl_send_frame(handle, FDL_CMD_CONNECT, NULL, 0);
+    int ret = fdl_send_frame(transport, FDL_CMD_CONNECT, NULL, 0);
     if (ret != 0)
         return ret;
-    return fdl_expect_ack(handle, FDL_RESP_ACK, 6000);
+    return fdl_expect_ack(transport, FDL_RESP_ACK, 6000);
 }
 
-int cmd_start_transfer(libusb_device_handle *handle, unsigned int addr,
-                       unsigned filesize)
+static int cmd_start_transfer(update_transport_t *transport, unsigned int addr,
+                              unsigned filesize)
 {
     unsigned char payload[8];
     int ret;
 
     put_le32(payload, addr);
     put_le32(payload + 4, filesize);
-    ret = fdl_send_frame(handle, FDL_CMD_START_TRANSFER, payload, sizeof(payload));
+    ret = fdl_send_frame(transport, FDL_CMD_START_TRANSFER, payload,
+                         sizeof(payload));
     if (ret != 0)
         return ret;
-    return fdl_expect_ack(handle, FDL_RESP_ACK, 6000);
+    return fdl_expect_ack(transport, FDL_RESP_ACK, 6000);
 }
 
 /* Two interactions per single transmission */
@@ -443,43 +460,41 @@ int cmd_exec_data(libusb_device_handle *handle)
 }
 
 /* Explicit little-endian implementation used by the update path below. */
-static int cmd_transfer_data_safe(libusb_device_handle *handle, int pack_size,
+static int cmd_transfer_data_safe(update_transport_t *transport, int pack_size,
                                   unsigned char *buf)
 {
     unsigned char payload[12];
-    int transferred, ret;
+    int ret;
 
     if (pack_size <= 0 || pack_size > UPDATE_PER_PACK || buf == NULL)
         return LIBUSB_ERROR_INVALID_PARAM;
     put_le32(payload, (unsigned int)pack_size);
     put_le32(payload + 4, 0);
     put_le32(payload + 8, 0);
-    ret = fdl_send_frame(handle, FDL_CMD_START_TRANSFER_DATA, payload,
+    ret = fdl_send_frame(transport, FDL_CMD_START_TRANSFER_DATA, payload,
                          sizeof(payload));
     if (ret != 0)
         return ret;
-    ret = fdl_expect_ack(handle, FDL_RESP_ACK, 6000);
+    ret = fdl_expect_ack(transport, FDL_RESP_ACK, 6000);
     if (ret != 0)
         return ret;
-    ret = libusb_bulk_transfer(handle, USB_UPDATE_OUT_ENDPOINT, buf, pack_size,
-                               &transferred, 3000);
+    ret = transport_send(transport, buf, (size_t)pack_size, 3000);
     if (ret != 0)
         return ret;
-    if (transferred != pack_size)
-        return LIBUSB_ERROR_IO;
-    return fdl_expect_ack(handle, FDL_RESP_ACK, 6000);
+    return fdl_expect_ack(transport, FDL_RESP_ACK, 6000);
 }
 
-static int cmd_transfer_end_safe(libusb_device_handle *handle)
+static int cmd_transfer_end_safe(update_transport_t *transport)
 {
     unsigned char data[BUFFER_SIZE];
     int actual_length, ret;
 
-    ret = fdl_send_frame(handle, FDL_CMD_START_TRANSFER_END, NULL, 0);
+    ret = fdl_send_frame(transport, FDL_CMD_START_TRANSFER_END, NULL, 0);
     if (ret != 0)
         return ret;
     for (;;) {
-        ret = fdl_receive_frame(handle, data, sizeof(data), &actual_length, 10000);
+        ret = fdl_receive_frame(transport, data, sizeof(data), &actual_length,
+                                10000);
         if (ret != 0)
             return ret;
         switch (get_le16(data + 6)) {
@@ -498,263 +513,213 @@ static int cmd_transfer_end_safe(libusb_device_handle *handle)
     }
 }
 
-static int cmd_execute_safe(libusb_device_handle *handle)
+static int cmd_execute_safe(update_transport_t *transport)
 {
-    int ret = fdl_send_frame(handle, FDL_CMD_EXECUTE, NULL, 0);
+    int ret = fdl_send_frame(transport, FDL_CMD_EXECUTE, NULL, 0);
     if (ret != 0)
         return ret;
-    return fdl_expect_ack(handle, FDL_RESP_ACK, 6000);
+    return fdl_expect_ack(transport, FDL_RESP_ACK, 6000);
 }
 
-int libusb_update_img(char *input_file, short vid, short pid)
+static void transport_close(update_transport_t *transport)
 {
-    libusb_context       *ctx    = NULL;
-    libusb_device_handle *handle = NULL;
-    FILE                 *txt_fd;
-    unsigned char         buffer[UPDATE_PER_PACK];
-    char                  filename[PATH_MAX], line[MAX_LINE_LEN];
-    unsigned int          file_size, w_addr, e_size;
-    long                  file_end;
-    int                   ret, fd, cnt = 0, bytes_read;
+    if (transport->usb_handle != NULL) {
+        if (transport->usb_claimed)
+            libusb_release_interface(transport->usb_handle, 0);
+        libusb_close(transport->usb_handle);
+        transport->usb_handle = NULL;
+    }
+    if (transport->usb_context != NULL) {
+        libusb_exit(transport->usb_context);
+        transport->usb_context = NULL;
+    }
+}
 
-    txt_fd = fopen(input_file, "r");
-    if (!txt_fd) {
-        fprintf(stderr, "no %s found\n", input_file);
+static int transport_open_usb(update_transport_t *transport, short vid,
+                              short pid)
+{
+    int ret;
+
+    ret = libusb_init(&transport->usb_context);
+    if (ret < 0) {
+        fprintf(stderr, "failed to initialize libusb: %s\n",
+                libusb_error_name(ret));
+        return ret;
+    }
+
+    transport->usb_handle = libusb_open_device_with_vid_pid(
+        transport->usb_context, (uint16_t)vid, (uint16_t)pid);
+    if (transport->usb_handle == NULL) {
+        fprintf(stderr, "err opening device vid-pid: %x-%x\n",
+                (unsigned short)vid, (unsigned short)pid);
+        transport_close(transport);
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+
+    libusb_set_auto_detach_kernel_driver(transport->usb_handle, 1);
+    ret = libusb_claim_interface(transport->usb_handle, 0);
+    if (ret < 0) {
+        fprintf(stderr, "err claiming interface: %s\n",
+                libusb_error_name(ret));
+        transport_close(transport);
+        return ret;
+    }
+    transport->usb_claimed = 1;
+    return 0;
+}
+
+static int update_one_image(update_transport_t *transport,
+                            const image_entry_t *entry)
+{
+    unsigned char buffer[UPDATE_PER_PACK];
+    int ret, fd, count, retries;
+
+    fd = open(entry->path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "open %s: %s\n", entry->name, strerror(errno));
+        return LIBUSB_ERROR_IO;
+    }
+    printf("USB update %s at 0x%08x, size 0x%x\n",
+           entry->name, entry->address, entry->file_size);
+    ret = cmd_start_transfer(transport, entry->address,
+                             entry->erase_size);
+    if (ret != 0)
+        goto out;
+    while ((count = read(fd, buffer, sizeof(buffer))) > 0) {
+        for (retries = 0; retries < MAX_ERRORS; retries++) {
+            ret = cmd_transfer_data_safe(transport, count, buffer);
+            if (ret == 0)
+                break;
+        }
+        if (ret != 0)
+            goto out;
+    }
+    if (count < 0) {
+        fprintf(stderr, "read %s: %s\n", entry->name, strerror(errno));
+        ret = LIBUSB_ERROR_IO;
+        goto out;
+    }
+    ret = cmd_transfer_end_safe(transport);
+out:
+    close(fd);
+    return ret;
+}
+
+static int update_usb(const image_package_t *package)
+{
+    update_transport_t transport = {0};
+    size_t i;
+    int ret;
+
+    ret = transport_open_usb(&transport, VENDOR_ID, PRODUCT_ID);
+    if (ret != 0)
         return -1;
-    }
-
-    ret = libusb_init(&ctx);
-    if (ret < 0) {
-        fprintf(stderr, "failed to initialize libusb: %s\n",
-                libusb_error_name(ret));
-        fclose(txt_fd);
-        return EXIT_FAILURE;
-    }
-
-    handle = libusb_open_device_with_vid_pid(ctx, vid, pid);
-    if (!handle) {
-        fprintf(stderr, "err opening device vid-pid: %x-%x\n", vid,
-                pid);
-        fclose(txt_fd);
-        libusb_exit(ctx);
-        return EXIT_FAILURE;
-    }
-
-    libusb_set_auto_detach_kernel_driver(handle, 1);
-
-    ret = libusb_claim_interface(handle, 0);
-    if (ret < 0) {
-        fprintf(stderr, "err claiming interface: %s\n",
-                libusb_error_name(ret));
-        fclose(txt_fd);
-        libusb_close(handle);
-        libusb_exit(ctx);
-        return EXIT_FAILURE;
-    }
-
-    /* BSL_CMD_HANDSHAKE */
-    ret = cmd_handshake(handle);
+    ret = cmd_handshake(&transport);
+    if (ret == 0)
+        ret = cmd_connect(&transport);
     if (ret != 0) {
-        fprintf(stderr, "cmd_handshake err\n");
-        goto update_end;
+        fprintf(stderr, "USB handshake/connect failed: %s\n",
+                libusb_error_name(ret));
+        goto out;
     }
-
-    /* BSL_CMD_CONNECT */
-    ret = cmd_connect(handle);
-    if (ret != 0) {
-        fprintf(stderr, "cmd_connect err\n");
-        goto update_end;
-    }
-
-    while (fgets(line, sizeof(line), txt_fd)) {
-        if (line[0] == '#')
+    for (i = 0; i < package->count; i++) {
+        if (i == package->comboot_index)
             continue;
-
-        ret = sscanf(line, "%1023s %x %x", filename, &w_addr, &e_size);
-        if (ret != 3) {
-            printf("warning: line format err: %s\n", line);
-            continue;
-        }
-
-        if (access(filename, F_OK) == 0) {
-            if ((fd = open(filename, O_RDONLY)) == -1) {
-                fprintf(stderr, "file opening err\n");
-                goto update_end;
-            }
-
-            file_end = lseek(fd, 0, SEEK_END);
-            if (file_end < 0 || (unsigned long)file_end > 0xffffffffUL) {
-                fprintf(stderr, "cannot determine size of %s: %s\n", filename,
-                        strerror(errno));
-                close(fd);
-                ret = LIBUSB_ERROR_INVALID_PARAM;
-                goto update_end;
-            }
-            file_size = (unsigned int)file_end;
-            if (lseek(fd, 0, SEEK_SET) < 0) {
-                fprintf(stderr, "cannot rewind %s: %s\n", filename,
-                        strerror(errno));
-                close(fd);
-                ret = LIBUSB_ERROR_IO;
-                goto update_end;
-            }
-
-            if (e_size == 0)
-                e_size = file_size;
-
-            printf("update name: %s, addr: 0x%x, erasesize: 0x%x\n",
-                   filename, w_addr, e_size);
-            ret = cmd_start_transfer(handle, w_addr, e_size);
-            if (ret != 0) {
-                fprintf(stderr, "cmd_start_transfer err\n");
-                close(fd);
-                goto update_end;
-            }
-
-            /* BSL_CMD_START_DATA */
-            while ((bytes_read = read(fd, buffer, UPDATE_PER_PACK)) > 0) {
-                cnt = 0;
-                while (cnt < MAX_ERRORS) {
-                    ret = cmd_transfer_data_safe(handle, bytes_read, buffer);
-                    if (ret != 0) {
-                        fprintf(stderr,
-                                "cmd_transfer_data err, cnt %d\n",
-                                cnt);
-                        cnt++;
-                    } else {
-                        break;
-                    }
-                }
-
-                if (MAX_ERRORS == cnt) {
-                    ret = LIBUSB_ERROR_IO;
-                    close(fd);
-                    goto update_end;
-                }
-            }
-            if (bytes_read < 0) {
-                fprintf(stderr, "read %s failed: %s\n", filename, strerror(errno));
-                ret = LIBUSB_ERROR_IO;
-                close(fd);
-                goto update_end;
-            }
-
-            ret = cmd_transfer_end_safe(handle);
-            if (ret != 0) {
-                fprintf(stderr, "cmd_ended_data err\n");
-                close(fd);
-                goto update_end;
-            }
-            close(fd);
-        } else {
-            fprintf(stderr, "file %s does not exist\n", filename);
-            ret = LIBUSB_ERROR_NOT_FOUND;
-            goto update_end;
+        ret = update_one_image(&transport, &package->entries[i]);
+        if (ret != 0) {
+            fprintf(stderr, "USB update failed for %s: %s\n",
+                    package->entries[i].name, libusb_error_name(ret));
+            goto out;
         }
     }
-
-    ret = cmd_execute_safe(handle);
-    if (ret != 0) {
-        fprintf(stderr, "cmd_exec_data err\n");
-        goto update_end;
-    }
-
-update_end:
-    fclose(txt_fd);
-    // release ctx and dev
-    libusb_release_interface(handle, 0);
-    libusb_close(handle);
-    libusb_exit(ctx);
-
-    return ret == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    ret = cmd_execute_safe(&transport);
+    if (ret != 0)
+        fprintf(stderr, "USB reboot failed: %s\n", libusb_error_name(ret));
+out:
+    transport_close(&transport);
+    return ret == 0 ? 0 : -1;
 }
 
-int libusb_uvc_reset(short vid, short pid)
+static void print_usage(FILE *stream, const char *program)
 {
-    libusb_context       *ctx    = NULL;
-    libusb_device_handle *handle = NULL;
-    int                   ret;
-    unsigned char        *data = NULL;
+    fprintf(stream,
+            "Usage: %s -p tty-device [-b baud] ax520_image_spi.zip\n"
+            "  -p DEVICE  serial bootloader tty device\n"
+            "  -b BAUD    serial baud rate (default: 115200)\n"
+            "  -h         show this help\n",
+            program);
+}
 
-    ret = libusb_init(&ctx);
-    if (ret < 0) {
-        fprintf(stderr, "failed to initialize libusb: %s\n",
-                libusb_error_name(ret));
-        return EXIT_FAILURE;
-    }
+static int parse_baud_rate(const char *text, unsigned int *baud)
+{
+    char *end;
+    unsigned long value;
 
-    handle = libusb_open_device_with_vid_pid(ctx, vid, pid);
-    if (!handle) {
-        fprintf(stderr, "err opening  device\n");
-        libusb_exit(ctx);
-        return EXIT_FAILURE;
-    }
-
-    libusb_set_auto_detach_kernel_driver(handle, 1);
-
-    ret = libusb_claim_interface(handle, 0);  // 假设接口索引为 0
-    if (ret < 0) {
-        fprintf(stderr, "err claiming interface: %s\n",
-                libusb_error_name(ret));
-        libusb_close(handle);
-        libusb_exit(ctx);
-        return EXIT_FAILURE;
-    }
-
-    // 发送自定义控制请求
-    ret = libusb_control_transfer(handle,
-                                  0x21,    // bmRequestType
-                                  0x1,     // 请求
-                                  0x0,     // wValue - 控制选择符和参数
-                                  0x0a00,  // wIndex - 接口编号
-                                  data,    // 数据缓冲区
-                                  0,       // 数据长度
-                                  10);     // 超时时间
-    // because udc reboot immediately, so omit the following steps or delay udc
-    libusb_release_interface(handle, 0);
-    libusb_close(handle);
-    libusb_exit(ctx);
-
-    return EXIT_SUCCESS;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value == 0 ||
+        value > UINT_MAX)
+        return -1;
+    *baud = (unsigned int)value;
+    return 0;
 }
 
 int main(int argc, char *argv[])
 {
-    short vid, pid;
-    int   ret;
+    const char *serial_device = NULL;
+    image_package_t package;
+    const image_entry_t *comboot;
+    unsigned int baud = 115200;
+    int option, ret;
 
-    if (argc != 2 && argc != 3) {
-        printf("usage_update:%s update.txt\n", argv[0]);
-        printf("usage_update: %s update.txt uvc\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    /* if reset, do reset */
-    if ((argc == 3) && (strcmp(argv[2], "uvc") == 0)) {
-        up_debug("reset uvc\n");
-        vid = UVC_VENDOR_ID;
-        pid = UVC_PRODUCT_ID;
-        libusb_uvc_reset(vid, pid);
-
-        sleep(5);
-        vid = VENDOR_ID;
-        pid = PRODUCT_ID;
-    } else {
-        /* get vid pid to tell enum done */
-        if (libusb_get_vid_pid() != 0) {
-            return -1;
-        } else {
-            usleep(10000);
-            vid = VENDOR_ID;
-            pid = PRODUCT_ID;
+    while ((option = getopt(argc, argv, "b:hp:")) != -1) {
+        switch (option) {
+        case 'b':
+            if (parse_baud_rate(optarg, &baud) != 0) {
+                fprintf(stderr, "invalid baud rate: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            break;
+        case 'p':
+            serial_device = optarg;
+            break;
+        case 'h':
+            print_usage(stdout, argv[0]);
+            return EXIT_SUCCESS;
+        default:
+            print_usage(stderr, argv[0]);
+            return EXIT_FAILURE;
         }
     }
 
-    ret = libusb_update_img(argv[1], vid, pid);
-    if (ret != 0) {
-        fprintf(stderr, "libusb_update_img failed\n");
-        return -1;
+    if (serial_device == NULL || argc - optind != 1) {
+        print_usage(stderr, argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (!serial_baud_supported(baud)) {
+        fprintf(stderr, "unsupported baud rate: %u\n", baud);
+        return EXIT_FAILURE;
     }
 
-    return 0;
+    if (image_package_load(&package, argv[optind]) != 0)
+        return EXIT_FAILURE;
+    comboot = &package.entries[package.comboot_index];
+    printf("ZIP validated: %zu images, comboot %s\n",
+           package.count, comboot->name);
+    fflush(stdout);
+    ret = serial_flash_comboot(serial_device, baud, comboot->path,
+                               comboot->address, comboot->erase_size);
+    if (ret == 0) {
+        ret = libusb_get_vid_pid();
+        if (ret == 0)
+            usleep(100000);
+    }
+    if (ret == 0)
+        ret = update_usb(&package);
+    image_package_release(&package);
+    if (ret != 0) {
+        fprintf(stderr, "firmware update failed\n");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
 }
