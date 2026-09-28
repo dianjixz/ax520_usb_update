@@ -14,6 +14,7 @@
 #include "image_package.h"
 #include "progress.h"
 #include "serial_boot.h"
+#include "debug.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 1024
@@ -263,20 +264,24 @@ static int cmd_handshake(update_transport_t *transport)
     unsigned char data[BUFFER_SIZE];
     int actual_length, ret;
 
+    debug_log("USB FDL handshake: sending probe");
     ret = transport_send(transport, probe, sizeof(probe), 3000);
     if (ret != 0)
         return ret;
 
+    debug_log("USB FDL handshake: waiting up to 6 s for version");
     ret = fdl_receive_frame(transport, data, sizeof(data), &actual_length, 6000);
     if (ret != 0)
         return ret;
     if (get_le16(data + 6) != FDL_RESP_VERSION)
         return LIBUSB_ERROR_IO;
+    debug_log("USB FDL version received (%d bytes)", actual_length);
     return 0;
 }
 
 static int cmd_connect(update_transport_t *transport)
 {
+    debug_log("USB FDL CONNECT: sending command and waiting for ACK");
     int ret = fdl_send_frame(transport, FDL_CMD_CONNECT, NULL, 0);
     if (ret != 0)
         return ret;
@@ -291,6 +296,8 @@ static int cmd_start_transfer(update_transport_t *transport, unsigned int addr,
 
     put_le32(payload, addr);
     put_le32(payload + 4, filesize);
+    debug_log("USB FDL START_TRANSFER: address=0x%08x erase_size=0x%x",
+              addr, filesize);
     ret = fdl_send_frame(transport, FDL_CMD_START_TRANSFER, payload,
                          sizeof(payload));
     if (ret != 0)
@@ -491,6 +498,7 @@ static int cmd_transfer_end_safe(update_transport_t *transport)
     progress_t progress = {0};
     int actual_length, ret;
 
+    debug_log("USB FDL TRANSFER_END: waiting for device write result");
     ret = fdl_send_frame(transport, FDL_CMD_START_TRANSFER_END, NULL, 0);
     if (ret != 0)
         return ret;
@@ -510,6 +518,7 @@ static int cmd_transfer_end_safe(update_transport_t *transport)
             break;
         case FDL_RESP_ACK:
             progress_finish(&progress);
+            debug_log("USB FDL device write ACK received");
             return 0;
         case FDL_RESP_OPERATION_FAIL:
             ret = LIBUSB_ERROR_IO;
@@ -526,6 +535,7 @@ out:
 
 static int cmd_execute_safe(update_transport_t *transport)
 {
+    debug_log("USB FDL EXECUTE: requesting reboot");
     int ret = fdl_send_frame(transport, FDL_CMD_EXECUTE, NULL, 0);
     if (ret != 0)
         return ret;
@@ -546,36 +556,19 @@ static void transport_close(update_transport_t *transport)
     }
 }
 
-static int transport_open_usb(update_transport_t *transport, short vid,
-                              short pid)
+static int transport_claim_usb(update_transport_t *transport)
 {
     int ret;
-
-    ret = libusb_init(&transport->usb_context);
-    if (ret < 0) {
-        fprintf(stderr, "failed to initialize libusb: %s\n",
-                libusb_error_name(ret));
-        return ret;
-    }
-
-    transport->usb_handle = libusb_open_device_with_vid_pid(
-        transport->usb_context, (uint16_t)vid, (uint16_t)pid);
-    if (transport->usb_handle == NULL) {
-        fprintf(stderr, "err opening device vid-pid: %x-%x\n",
-                (unsigned short)vid, (unsigned short)pid);
-        transport_close(transport);
-        return LIBUSB_ERROR_NO_DEVICE;
-    }
 
     libusb_set_auto_detach_kernel_driver(transport->usb_handle, 1);
     ret = libusb_claim_interface(transport->usb_handle, 0);
     if (ret < 0) {
         fprintf(stderr, "err claiming interface: %s\n",
                 libusb_error_name(ret));
-        transport_close(transport);
         return ret;
     }
     transport->usb_claimed = 1;
+    debug_log("USB interface 0 claimed");
     return 0;
 }
 
@@ -595,6 +588,9 @@ static int update_one_image(update_transport_t *transport,
     }
     printf("USB update %s at 0x%08x, size 0x%x\n",
            entry->name, entry->address, entry->file_size);
+    debug_log("image %s: file=%s, address=0x%08x, size=%u, erase=%u",
+              entry->name, entry->path, entry->address,
+              entry->file_size, entry->erase_size);
     ret = cmd_start_transfer(transport, entry->address,
                              entry->erase_size);
     if (ret != 0)
@@ -607,6 +603,9 @@ static int update_one_image(update_transport_t *transport,
             ret = cmd_transfer_data_safe(transport, count, buffer);
             if (ret == 0)
                 break;
+            debug_log("USB data transfer retry %d/%d at offset %llu: %s",
+                      retries + 1, MAX_ERRORS, (unsigned long long)bytes_sent,
+                      libusb_error_name(ret));
         }
         if (ret != 0)
             goto out;
@@ -624,46 +623,49 @@ static int update_one_image(update_transport_t *transport,
         goto out;
     }
     progress_finish(&progress);
+    debug_log("USB transfer complete for %s (%llu bytes)", entry->name,
+              (unsigned long long)bytes_sent);
     ret = cmd_transfer_end_safe(transport);
+    if (ret == 0)
+        debug_log("image %s completed", entry->name);
 out:
     progress_abort(&progress);
     close(fd);
     return ret;
 }
 
-static int update_usb(const image_entry_t *entries, size_t count,
+static int update_usb(update_transport_t *transport,
+                      const image_entry_t *entries, size_t count,
                       size_t skip_index)
 {
-    update_transport_t transport = {0};
     size_t i;
     int ret;
 
-    ret = transport_open_usb(&transport, VENDOR_ID, PRODUCT_ID);
-    if (ret != 0)
-        return -1;
-    ret = cmd_handshake(&transport);
+    ret = cmd_handshake(transport);
     if (ret == 0)
-        ret = cmd_connect(&transport);
+        ret = cmd_connect(transport);
     if (ret != 0) {
         fprintf(stderr, "USB handshake/connect failed: %s\n",
                 libusb_error_name(ret));
         goto out;
     }
+    debug_log("USB FDL connection ready; %zu images scheduled",
+              count - (skip_index < count ? 1U : 0U));
     for (i = 0; i < count; i++) {
         if (i == skip_index)
             continue;
-        ret = update_one_image(&transport, &entries[i]);
+        ret = update_one_image(transport, &entries[i]);
         if (ret != 0) {
             fprintf(stderr, "USB update failed for %s: %s\n",
                     entries[i].name, libusb_error_name(ret));
             goto out;
         }
     }
-    ret = cmd_execute_safe(&transport);
+    ret = cmd_execute_safe(transport);
     if (ret != 0)
         fprintf(stderr, "USB reboot failed: %s\n", libusb_error_name(ret));
 out:
-    transport_close(&transport);
+    transport_close(transport);
     return ret == 0 ? 0 : -1;
 }
 
@@ -671,13 +673,14 @@ static void print_usage(FILE *stream, const char *program)
 {
     fprintf(stream,
             "Usage:\n"
-            "  %s [-p tty-device] [-b baud] [-l] [-u] ax520_image_spi.zip\n"
-            "  %s -p tty-device [-b baud] [-l] bootload image "
+            "  %s [-p tty-device] [-b baud] [-l] [-d] [-u] ax520_image_spi.zip\n"
+            "  %s -p tty-device [-b baud] [-l] [-d] bootload image "
             "[flash image start ...]\n"
-            "  %s flash image start [flash image start ...]\n"
+            "  %s [-d] flash image start [flash image start ...]\n"
             "  -p DEVICE  serial bootloader tty device (for bootload)\n"
             "  -b BAUD    serial baud rate (default: 115200)\n"
             "  -l         print serial logs during bootload and USB wait\n"
+            "  -d         detailed diagnostics; also prints serial logs with -p\n"
             "  -u         force USB-only ZIP update even when -p is set\n"
             "  -h         show this help\n",
             program, program, program);
@@ -706,22 +709,30 @@ static int wait_and_update_usb(const image_entry_t *entries, size_t count,
                                size_t skip_index,
                                serial_log_monitor_t *serial_monitor)
 {
+    update_transport_t transport = {0};
     int ret;
 
     printf("Waiting for USB download device 32c9:1000\n");
     fflush(stdout);
-    if (serial_monitor != NULL) {
-        ret = libusb_get_vid_pid_with_callback(drain_serial_log,
-                                                serial_monitor);
-        serial_log_drain(serial_monitor);
+    ret = libusb_init(&transport.usb_context);
+    if (ret == 0)
+        ret = libusb_wait_open_device(transport.usb_context,
+                                      &transport.usb_handle,
+                                      serial_monitor != NULL ? drain_serial_log : NULL,
+                                      serial_monitor);
+    if (serial_monitor != NULL)
         serial_log_close(serial_monitor);
-    } else {
-        ret = libusb_get_vid_pid();
-    }
-    if (ret != 0)
+    if (ret != 0) {
+        fprintf(stderr, "USB wait/open failed: %s\n", libusb_error_name(ret));
+        transport_close(&transport);
         return -1;
-    usleep(100000);
-    return update_usb(entries, count, skip_index);
+    }
+    debug_log("USB 32c9:1000 opened; claiming interface immediately");
+    if (transport_claim_usb(&transport) != 0) {
+        transport_close(&transport);
+        return -1;
+    }
+    return update_usb(&transport, entries, count, skip_index);
 }
 
 static int run_zip(const char *zip_path, const char *serial_device,
@@ -871,9 +882,10 @@ int main(int argc, char *argv[])
     unsigned int baud = 115200;
     int skip_bootload = 0;
     int show_serial_log = 0;
+    int debug = 0;
     int option, ret;
 
-    while ((option = getopt(argc, argv, "+b:hlp:u")) != -1) {
+    while ((option = getopt(argc, argv, "+b:dhlp:u")) != -1) {
         switch (option) {
         case 'b':
             if (parse_baud_rate(optarg, &baud) != 0) {
@@ -886,6 +898,9 @@ int main(int argc, char *argv[])
             break;
         case 'l':
             show_serial_log = 1;
+            break;
+        case 'd':
+            debug = 1;
             break;
         case 'u':
             skip_bootload = 1;
@@ -919,6 +934,15 @@ int main(int argc, char *argv[])
         !serial_baud_supported(baud)) {
         fprintf(stderr, "unsupported baud rate: %u\n", baud);
         return EXIT_FAILURE;
+    }
+    if (debug) {
+        debug_enable();
+        if (serial_device != NULL && !skip_bootload &&
+            strcmp(argv[optind], "flash") != 0)
+            show_serial_log = 1;
+        debug_log("diagnostics enabled; serial=%s, baud=%u, raw serial log=%s",
+                  serial_device != NULL && !skip_bootload ? serial_device : "off",
+                  baud, show_serial_log ? "on" : "off");
     }
 
     if (strcmp(argv[optind], "bootload") == 0 ||

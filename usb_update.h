@@ -11,6 +11,8 @@
 #ifndef _USB_UPDATA_H_
 #define _USB_UPDATA_H_
 
+#include <libusb-1.0/libusb.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
@@ -64,9 +66,9 @@ typedef enum {
 #define MAX_ERRORS      (2)          // 错误重传次数
 #define UPDATE_PER_PACK 0x100        // 单次数据包长度, 不大于(BUFFER_SIZE - 12)
 
-#define SYS_USB_PATH "/sys/bus/usb/devices"
-extern int libusb_get_vid_pid(void);
-extern int libusb_get_vid_pid_with_callback(void (*on_wait)(void *), void *context);
+int libusb_wait_open_device(libusb_context *context,
+                            libusb_device_handle **handle,
+                            void (*on_wait)(void *), void *callback_context);
 
 #define up_debug(fmt, ...)  // printf(fmt, ##__VA_ARGS__)
 

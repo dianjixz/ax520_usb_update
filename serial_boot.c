@@ -1,6 +1,7 @@
 #define _DEFAULT_SOURCE
 #include "serial_boot.h"
 #include "progress.h"
+#include "debug.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +32,7 @@
 #define SERIAL_PROBE_INTERVAL_MS 30
 #define SERIAL_REOPEN_INTERVAL_MS 500
 #define SERIAL_RESET_LIMIT 3U
+#define SERIAL_HANDSHAKE_TIMEOUT_MS 30000
 
 typedef enum serial_recovery_state {
     SERIAL_WAIT_USB,
@@ -54,6 +56,8 @@ struct serial_log_monitor {
     size_t reset_offset;
     unsigned int reset_count;
     int reset_limit_reported;
+    unsigned int probe_count;
+    int64_t next_debug_ms;
 };
 
 typedef serial_log_monitor_t serial_reader_t;
@@ -143,15 +147,24 @@ static int wait_fd(int fd, short events, int64_t deadline)
 {
     struct pollfd pfd = {.fd = fd, .events = events};
     int64_t now;
-    int ret;
+    int ret, timeout;
 
     for (;;) {
         now = now_ms();
         if (now < 0 || now >= deadline)
             return -1;
-        ret = poll(&pfd, 1, (int)(deadline - now));
+        timeout = (int)(deadline - now);
+        if (debug_enabled() && timeout > 5000)
+            timeout = 5000;
+        ret = poll(&pfd, 1, timeout);
         if (ret > 0)
             return (pfd.revents & events) ? 0 : -1;
+        if (ret == 0 && debug_enabled() && now_ms() < deadline) {
+            debug_log("serial %s still waiting (fd=%d, %lld ms left)",
+                      events == POLLIN ? "receive" : "send", fd,
+                      (long long)(deadline - now_ms()));
+            continue;
+        }
         if (ret == 0 || errno != EINTR)
             return -1;
     }
@@ -285,6 +298,8 @@ static int serial_monitor_note_byte(serial_log_monitor_t *monitor,
         if (monitor->reset_count < SERIAL_RESET_LIMIT) {
             monitor->recovery_state = SERIAL_WAIT_PROMPT;
             monitor->next_probe_ms = 0;
+            monitor->probe_count = 0;
+            monitor->next_debug_ms = 0;
             printf("Device reports USB not plugged in; probing U-Boot prompt\n");
         } else if (!monitor->reset_limit_reported) {
             monitor->reset_limit_reported = 1;
@@ -317,9 +332,17 @@ static int serial_monitor_send(serial_log_monitor_t *monitor)
     if (monitor->recovery_state == SERIAL_WAIT_PROMPT &&
         now >= monitor->next_probe_ms) {
         count = write(monitor->fd, &probe, 1);
-        if (count == 1)
+        if (count == 1) {
             monitor->next_probe_ms = now + SERIAL_PROBE_INTERVAL_MS;
-        else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+            monitor->probe_count++;
+            if (debug_enabled() && now >= monitor->next_debug_ms) {
+                finish_serial_log_line(monitor);
+                debug_log("serial U-Boot prompt probe: %u CR bytes sent, reset %u/%u",
+                          monitor->probe_count, monitor->reset_count,
+                          SERIAL_RESET_LIMIT);
+                monitor->next_debug_ms = now + 1000;
+            }
+        } else if (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                  errno != EINTR)
             return -1;
     } else if (monitor->recovery_state == SERIAL_SENDING_RESET) {
@@ -357,6 +380,11 @@ void serial_log_drain(serial_log_monitor_t *monitor)
             return;
         monitor->fd = open_serial(monitor->device, monitor->baud, 1);
         if (monitor->fd < 0) {
+            if (debug_enabled() && now_ms() >= monitor->next_debug_ms) {
+                debug_log("serial reopen %s failed: %s", monitor->device,
+                          strerror(errno));
+                monitor->next_debug_ms = now_ms() + 5000;
+            }
             monitor->next_reopen_ms = now_ms() + SERIAL_REOPEN_INTERVAL_MS;
             return;
         }
@@ -403,6 +431,9 @@ void serial_log_drain(serial_log_monitor_t *monitor)
 
 disconnected:
     finish_serial_log_line(monitor);
+    debug_log("serial monitor %s: %s", monitor->stop_monitoring ?
+              "closed after USB connection report" : "disconnected",
+              monitor->device);
     close(monitor->fd);
     monitor->fd = -1;
     monitor->recent_length = 0;
@@ -465,14 +496,17 @@ static int expect_ack(serial_reader_t *reader, unsigned int timeout_ms)
 
 static int handshake(serial_reader_t *reader)
 {
-    int64_t deadline = now_ms() + 10000;
+    int64_t deadline = now_ms() + SERIAL_HANDSHAKE_TIMEOUT_MS;
     int response;
 
+    debug_log("waiting up to %d s for ROM boot notification on %s",
+              SERIAL_HANDSHAKE_TIMEOUT_MS / 1000, reader->device);
     while ((response = receive_command(reader, deadline)) >= 0) {
         if (response != HDBOOT_NOTIFY && response != MINIBOOT_NOTIFY)
             continue;
         printf("Serial boot notify: %s\n",
                response == HDBOOT_NOTIFY ? "HDBOOT" : "MINIBOOT");
+        debug_log("sending serial DEBUG command");
         if (send_command(reader->fd, DEBUG_CMD, NULL, 0) != 0)
             return -1;
         if (response == MINIBOOT_NOTIFY) {
@@ -560,6 +594,8 @@ int serial_flash_comboot(const char *device, unsigned int baud,
     fd = open_serial(device, baud, 0);
     if (fd < 0)
         goto out;
+    debug_log("serial opened: %s at %u baud; comboot=%s (%lld bytes)",
+              device, baud, image_path, (long long)info.st_size);
     reader->fd = fd;
     if (handshake(reader) != 0)
         goto out;
@@ -567,11 +603,13 @@ int serial_flash_comboot(const char *device, unsigned int baud,
     put_be32(payload, address);
     put_be32(payload + 4, erase_size / 4);
     printf("Serial erase comboot at 0x%08x, size 0x%x\n", address, erase_size);
+    debug_log("sending serial ERASE command; waiting up to 180 s for ACK");
     if (send_command(fd, ERASE_CMD, payload, sizeof(payload)) != 0 ||
         expect_ack(reader, 180000) != 0)
         goto out;
 
     progress_start(&progress, "Serial comboot", (uint64_t)info.st_size);
+    debug_log("serial comboot transfer started");
     reader->progress_active = 1;
     while ((length = fread(chunk, 1, sizeof(chunk), image)) != 0) {
         size_t padded = (length + 3) & ~(size_t)3;
@@ -587,8 +625,10 @@ int serial_flash_comboot(const char *device, unsigned int baud,
         goto out;
     progress_finish(&progress);
     reader->progress_active = 0;
+    debug_log("serial comboot transfer complete (%u bytes)", offset);
 
     put_be32(payload, address);
+    debug_log("sending serial RUN command at 0x%08x", address);
     if (send_command(fd, RUN_CMD, payload, 4) != 0 ||
         expect_ack(reader, 1000) != 0)
         goto out;

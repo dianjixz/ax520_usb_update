@@ -1,5 +1,6 @@
 #define _DEFAULT_SOURCE
 #include "image_package.h"
+#include "debug.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -278,6 +279,9 @@ int image_package_load(image_package_t *package, const char *zip_path)
         fprintf(stderr, "cannot open ZIP or create temporary directory\n");
         return -1;
     }
+    debug_log("ZIP opened: %s; temporary directory %s", archive,
+              package->temp_dir);
+    debug_log("extracting and validating ax520_image.json");
     if (snprintf(manifest, sizeof(manifest), "%s/ax520_image.json",
                  package->temp_dir) >= (int)sizeof(manifest) ||
         run_to_file("unzip", manifest_args, NULL, manifest, 64 * 1024) != 0 ||
@@ -286,10 +290,13 @@ int image_package_load(image_package_t *package, const char *zip_path)
         fprintf(stderr, "invalid ax520_image.json in ZIP\n");
         goto fail;
     }
+    debug_log("ZIP manifest validated: %zu images", package->count);
     for (i = 0; i < package->count; i++) {
         image_entry_t *entry = &package->entries[i];
         char *image_args[] = {"unzip", "-p", archive, entry->name, NULL};
 
+        debug_log("extracting ZIP image %zu/%zu: %s", i + 1,
+                  package->count, entry->name);
         if (snprintf(entry->path, sizeof(entry->path), "%s/%s",
                      package->temp_dir, entry->name) >= (int)sizeof(entry->path) ||
             run_to_file("unzip", image_args, NULL, entry->path,
@@ -300,6 +307,9 @@ int image_package_load(image_package_t *package, const char *zip_path)
             goto fail;
         }
         entry->file_size = (uint32_t)info.st_size;
+        debug_log("validated %s: %u bytes, address=0x%08x, erase=0x%x",
+                  entry->name, entry->file_size, entry->address,
+                  entry->erase_size);
         if (entry->file_size > entry->declared_size)
             fprintf(stderr,
                     "warning: %s is %u bytes, larger than IMAGE_SIZE 0x%x; "

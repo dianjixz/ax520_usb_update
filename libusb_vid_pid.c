@@ -1,112 +1,78 @@
 #define _DEFAULT_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <dirent.h>
-#include <unistd.h>
 #include "usb_update.h"
+#include "debug.h"
+
+#include <stdint.h>
+#include <stdio.h>
 #include <time.h>
-#include <limits.h>
-#include <errno.h>
+#include <unistd.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 1024
-#endif
+#define USB_WAIT_TIMEOUT_MS 120000
+#define USB_POLL_INTERVAL_US 5000
 
-#define TIMEOUT_SECONDS 60
-
-int read_hex_short(char *path, unsigned short *value)
+static int64_t elapsed_ms(const struct timespec *start)
 {
-    FILE *fp = fopen(path, "r");
-    if (!fp)
-        return -1;
+    struct timespec now;
 
-    char buf[16];
-    if (!fgets(buf, sizeof(buf), fp)) {
-        fclose(fp);
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return -1;
-    }
-    fclose(fp);
-
-    // 去掉换行符
-    buf[strcspn(buf, "\n")] = 0;
-
-    // 16进制转换
-    unsigned int temp;
-    if (sscanf(buf, "%x", &temp) != 1)
-        return -1;
-    if (temp > 0xFFFF)
-        return -1;
-
-    *value = (unsigned short)temp;
-    return 0;
+    return (int64_t)(now.tv_sec - start->tv_sec) * 1000 +
+           (now.tv_nsec - start->tv_nsec) / 1000000;
 }
 
-int is_usb_device_dir(const char *name)
+int libusb_wait_open_device(libusb_context *context,
+                            libusb_device_handle **handle,
+                            void (*on_wait)(void *), void *callback_context)
 {
-    // USB device dirs一般格式如 "1-1", "2-1.3", 排除非设备目录如 "usb1", "usb2"
-    // 简单判断：名称中有 '-' 视为设备目录
-    return strchr(name, '-') != NULL;
-}
+    struct timespec started;
+    int64_t elapsed, next_log = 0;
+    libusb_device **devices;
+    struct libusb_device_descriptor descriptor;
+    ssize_t count, i;
+    int ret;
 
-int check_usb_device_present(void)
-{
-    struct dirent *entry;
-    unsigned short usbup_vid = 0, usbup_pid = 0;
-    char           vid_path[PATH_MAX], pid_path[PATH_MAX];
+    *handle = NULL;
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+        return LIBUSB_ERROR_OTHER;
 
-    DIR *dir = opendir(SYS_USB_PATH);
-    if (!dir) {
-        fprintf(stderr, "opendir\n");
-        return -1;
-    }
-
-    while ((entry = readdir(dir)) != NULL) {
-        if (!is_usb_device_dir(entry->d_name))
-            continue;
-
-        snprintf(vid_path, sizeof(vid_path), "%s/%s/idVendor",
-                 SYS_USB_PATH, entry->d_name);
-        snprintf(pid_path, sizeof(pid_path), "%s/%s/idProduct",
-                 SYS_USB_PATH, entry->d_name);
-
-        if (read_hex_short(vid_path, &usbup_vid) == 0 && read_hex_short(pid_path, &usbup_pid) == 0) {
-            if ((usbup_vid == VENDOR_ID) && (usbup_pid == PRODUCT_ID)) {
-                closedir(dir);
-                return 1;
-            }
-        }
-    }
-
-    closedir(dir);
-    return 0;
-}
-
-int libusb_get_vid_pid_with_callback(void (*on_wait)(void *), void *context)
-{
-    time_t start = time(NULL);
-
-    while (1) {
+    for (;;) {
         if (on_wait != NULL)
-            on_wait(context);
-        if (check_usb_device_present() > 0) {
-            printf("device detected\n");
-            return 0;
-        }
+            on_wait(callback_context);
+        count = libusb_get_device_list(context, &devices);
+        if (count < 0)
+            return (int)count;
+        for (i = 0; i < count; i++) {
+            if (libusb_get_device_descriptor(devices[i], &descriptor) != 0 ||
+                descriptor.idVendor != VENDOR_ID ||
+                descriptor.idProduct != PRODUCT_ID)
+                continue;
 
-        if (time(NULL) - start >= TIMEOUT_SECONDS) {
-            printf("device detected timeout %d\n", TIMEOUT_SECONDS);
-            return 1;
+            debug_log("USB 32c9:1000 enumerated on bus %u, address %u; opening now",
+                      libusb_get_bus_number(devices[i]),
+                      libusb_get_device_address(devices[i]));
+            ret = libusb_open(devices[i], handle);
+            libusb_free_device_list(devices, 1);
+            if (ret == 0)
+                return 0;
+            if (ret != LIBUSB_ERROR_NO_DEVICE)
+                return ret;
+            break;
         }
+        if (i == count)
+            libusb_free_device_list(devices, 1);
 
-        /* Avoid a tight polling loop while the board re-enumerates. */
-        usleep(10000);
+        elapsed = elapsed_ms(&started);
+        if (elapsed < 0)
+            return LIBUSB_ERROR_OTHER;
+        if (elapsed >= USB_WAIT_TIMEOUT_MS) {
+            fprintf(stderr, "USB device 32c9:1000 not detected within 60 s\n");
+            return LIBUSB_ERROR_TIMEOUT;
+        }
+        if (elapsed >= next_log) {
+            debug_log("waiting for USB 32c9:1000 (%lld/60 s elapsed)",
+                      (long long)(elapsed / 1000));
+            next_log = elapsed + 5000;
+        }
+        usleep(USB_POLL_INTERVAL_US);
     }
-
-    return 1;
-}
-
-int libusb_get_vid_pid(void)
-{
-    return libusb_get_vid_pid_with_callback(NULL, NULL);
 }

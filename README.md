@@ -18,6 +18,10 @@ make
 ./build/usb_update -p /dev/ttyUSB0 ax520_image_spi.zip
 ```
 
+如果通过外部电源开关让设备进入 ROM 模式，应先启动程序，再在 30 秒内给设备上电。
+程序在串口完成 comboot 后会立即用 libusb 等待并打开 `32c9:1000`，
+以免错过设备短暂出现的窗口。USB 接口权限不足时需使用 `sudo`。
+
 `-p` 指定启动串口设备；`-b` 可指定波特率，默认值为 `115200`。例如：
 
 ```sh
@@ -33,6 +37,21 @@ make
 设备输出的文本会以 `[serial]` 前缀打印到标准错误；协议通知和 ACK 不会混入日志。
 启动 comboot 后，程序在等待 USB 设备出现时会继续打印串口日志。`-l` 只控制
 日志打印，下面的 USB 连接检测与复位处理在串口烧录模式下始终启用；纯 USB 模式不能使用 `-l`。
+
+排查卡住的阶段时，加 `-d` 输出带启动后耗时的详细诊断日志。串口模式下
+`-d` 也会打印设备发来的串口日志，无需再加 `-l`：
+
+```sh
+./build/usb_update -d -p /dev/ttyUSB0 ax520_image_spi.zip
+```
+
+调试日志写到标准错误，包含 ZIP 解包校验、串口握手和擦除等待、USB 设备检测
+（每 5 秒报告一次）、串口重连/复位探测、USB 协议握手和逐镜像烧录状态。
+只用 USB 烧录时也可以加 `-d`，但没有串口设备日志。保存完整日志可用：
+
+```sh
+sudo ./build/usb_update -d -p /dev/ttyACM0 ax520_image_spi.zip 2>&1 | tee update.log
+```
 
 如果设备已经运行 comboot 并进入 USB 下载模式，省略 `-p` 即可跳过串口
 bootload 阶段，直接烧录 ZIP 中除 comboot 外的镜像：
